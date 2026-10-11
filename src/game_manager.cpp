@@ -2349,7 +2349,12 @@ bool GameManager_CheckDesync() {
 
         } else {
             if (DesyncMenu_Menu()) {
-                if (!GameManager_LoadGame(10, GameManager_MenuFadeOut())) {
+                const auto mission = ResourceManager_GetMissionManager()->GetMission();
+                const auto save_file_category = SaveLoad_GetSaveFileCategory(mission->GetCategory());
+
+                // Restart from the latest autosave, not from the save file this session was started from
+                if (!mission->SetMission(SaveLoad_GetFilePath(save_file_category, 10)) ||
+                    !GameManager_LoadGame(10, GameManager_MenuFadeOut())) {
                     GameManager_GameState = GAME_STATE_3_MAIN_MENU;
 
                     MessageManager_DrawMessage(_(df36), MESSAGE_BOX_INFO, MESSAGE_BOX_MODAL);
