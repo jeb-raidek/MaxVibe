@@ -137,6 +137,16 @@ static bool Remote_P24_Signals[TRANSPORT_MAX_TEAM_COUNT];
 static bool Remote_P49_Signal;
 static bool Remote_P51_Signal;
 
+/* Site selection is negotiated in rounds. Every peer sends its mission supplies once per round and decides on the
+ * same snapshot, otherwise with three or more players a peer that is still waiting for a round could act on supplies
+ * from a later round and the peers would disagree on whether another round is needed. A peer can be at most one
+ * round ahead of the others, so a single pending packet per team suffices.
+ */
+static uint8_t Remote_SiteSelectRound;
+static uint8_t Remote_P12_PendingRound[TRANSPORT_MAX_TEAM_COUNT];
+static bool Remote_P12_PendingValid[TRANSPORT_MAX_TEAM_COUNT];
+static NetPacket Remote_P12_PendingPackets[TRANSPORT_MAX_TEAM_COUNT];
+
 static OrderProcessor Remote_OrderProcessors[ORDER_COUNT_MAX];
 
 static uint16_t Remote_GenerateEntityId();
@@ -167,6 +177,8 @@ static void Remote_AnnounceLeave(uint16_t team, bool mode);
 static bool Remote_AnalyzeDesyncHost(SmartList<UnitInfo>& units);
 static bool Remote_DrawBarrierWaitIndicator(bool is_drawn, uint64_t time_stamp);
 static void Remote_ClearBarrierWaitIndicator(bool is_drawn);
+static void Remote_AdvanceSiteSelectRound();
+static void Remote_ReadMissionSupplies(uint16_t team, NetPacket& packet);
 static void Remote_CreateNetPacket_23(UnitInfo* unit, NetPacket& packet);
 static void Remote_ProcessNetPacket_23(struct Packet23Data& data, NetPacket& packet);
 static void Remote_NetErrorUnknownUnit(uint16_t unit_id);
@@ -645,8 +657,11 @@ void Remote_Init() {
     Remote_SendSynchFrame = true;
     Remote_RemotePlayerCount = 0;
     Remote_P51_Signal = false;
+    Remote_SiteSelectRound = 0;
 
     for (int32_t i = 0; i < TRANSPORT_MAX_TEAM_COUNT; ++i) {
+        Remote_P12_PendingValid[i] = false;
+        Remote_P12_PendingPackets[i].Reset();
         Remote_FrameSyncCounter2values[i] = 0;
         Remote_FrameSyncCounter[i] = 0;
         Remote_NextTurnIndices[i] = 0;
@@ -1732,33 +1747,31 @@ int32_t Remote_SiteSelectMenu() {
         MessageManager_ClearMessageBox();
     }
 
-    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+    int32_t proximity_state = 0;
+
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT && !proximity_state; ++team) {
         if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
-            int32_t proximity_state = GameManager_CheckLandingZones(GameManager_PlayerTeam, team);
+            proximity_state = GameManager_CheckLandingZones(GameManager_PlayerTeam, team);
+        }
+    }
 
-            if (proximity_state != 0) {
-                UnitsManager_TeamMissionSupplies[team].units.Clear();
-
-                return proximity_state;
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT && !proximity_state; ++team) {
+        if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+            for (int32_t team2 = 0; team2 < TRANSPORT_MAX_TEAM_COUNT; ++team2) {
+                if (team != team2 && UnitsManager_TeamInfo[team2].team_type == TEAM_TYPE_REMOTE &&
+                    GameManager_CheckLandingZones(team, team2)) {
+                    proximity_state = 5;
+                    break;
+                }
             }
         }
     }
 
-    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
-        if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
-            for (int32_t team2 = 0; team2 < TRANSPORT_MAX_TEAM_COUNT; ++team2) {
-                if (team != team2) {
-                    if (UnitsManager_TeamInfo[team2].team_type == TEAM_TYPE_REMOTE) {
-                        if (GameManager_CheckLandingZones(team, team2)) {
-                            UnitsManager_TeamMissionSupplies[team].units.Clear();
-                            UnitsManager_TeamMissionSupplies[team2].units.Clear();
+    if (proximity_state) {
+        /* every peer sees the same conflict and selects again, so wait for fresh supplies from all of them */
+        Remote_AdvanceSiteSelectRound();
 
-                            return 5;
-                        }
-                    }
-                }
-            }
-        }
+        return proximity_state;
     }
 
     Randomizer_SetSeed(Remote_RngSeed);
@@ -2230,6 +2243,7 @@ void Remote_SendNetPacket_12(int32_t team) {
 
     packet << static_cast<uint8_t>(REMOTE_PACKET_12);
     packet << static_cast<uint16_t>(team);
+    packet << Remote_SiteSelectRound;
 
     packet << supplies->start_gold;
     packet << supplies->team_gold;
@@ -2248,6 +2262,7 @@ void Remote_SendNetPacket_12(int32_t team) {
 
 void Remote_ReceiveNetPacket_12(NetPacket& packet) {
     uint16_t entity_id;
+    uint8_t round;
 
     packet >> entity_id;
 
@@ -2255,7 +2270,52 @@ void Remote_ReceiveNetPacket_12(NetPacket& packet) {
         return;
     }
 
-    TeamMissionSupplies* supplies = &UnitsManager_TeamMissionSupplies[entity_id];
+    packet >> round;
+
+    if (packet.IsMalformed()) {
+        return;
+    }
+
+    if (round == Remote_SiteSelectRound) {
+        Remote_ReadMissionSupplies(entity_id, packet);
+
+    } else if (round == static_cast<uint8_t>(Remote_SiteSelectRound + 1)) {
+        Remote_P12_PendingPackets[entity_id].Reset();
+        Remote_P12_PendingPackets[entity_id].Write(packet.GetBuffer(), packet.GetDataSize());
+        Remote_P12_PendingRound[entity_id] = round;
+        Remote_P12_PendingValid[entity_id] = true;
+
+    } else {
+        AILOG(log, "Remote: Dropped stale mission supplies of team {} (round {}, expected {}).\n", entity_id, round,
+              Remote_SiteSelectRound);
+    }
+}
+
+void Remote_AdvanceSiteSelectRound() {
+    ++Remote_SiteSelectRound;
+
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+        if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+            UnitsManager_TeamMissionSupplies[team].units.Clear();
+            UnitsManager_TeamMissionSupplies[team].cargos.Clear();
+
+            if (Remote_P12_PendingValid[team] && Remote_P12_PendingRound[team] == Remote_SiteSelectRound) {
+                Remote_ReadMissionSupplies(team, Remote_P12_PendingPackets[team]);
+
+                if (Remote_P12_PendingPackets[team].IsMalformed()) {
+                    UnitsManager_TeamMissionSupplies[team].units.Clear();
+                    UnitsManager_TeamMissionSupplies[team].cargos.Clear();
+                }
+            }
+        }
+
+        Remote_P12_PendingValid[team] = false;
+        Remote_P12_PendingPackets[team].Reset();
+    }
+}
+
+void Remote_ReadMissionSupplies(uint16_t team, NetPacket& packet) {
+    TeamMissionSupplies* supplies = &UnitsManager_TeamMissionSupplies[team];
 
     supplies->units.Clear();
     supplies->cargos.Clear();
@@ -2265,7 +2325,7 @@ void Remote_ReceiveNetPacket_12(NetPacket& packet) {
     packet >> supplies->start_gold;
     packet >> supplies->team_gold;
     packet >> unit_count;
-    packet >> UnitsManager_TeamInfo[entity_id].stats_gold_spent_on_upgrades;
+    packet >> UnitsManager_TeamInfo[team].stats_gold_spent_on_upgrades;
     packet >> supplies->starting_position;
     packet >> supplies->proximity_alert_ack;
 
