@@ -1879,15 +1879,29 @@ bool Remote_CheckDesync(uint16_t team, uint16_t crc_checksum) {
 
     Remote_ClearBarrierWaitIndicator(is_indicator_drawn);
 
+    bool result = true;
+
     for (int32_t i = TRANSPORT_MAX_TEAM_COUNT - 1; i >= 0; --i) {
         if (UnitsManager_TeamInfo[i].team_type == TEAM_TYPE_REMOTE) {
             if (Remote_TeamDataCrc16[i] != crc_checksum && Remote_IsNetworkGame) {
-                return false;
+                result = false;
             }
         }
     }
 
-    return true;
+    if (!result) {
+        std::string checksums = std::format("team {} {:04X}", team, crc_checksum);
+
+        for (int32_t i = 0; i < TRANSPORT_MAX_TEAM_COUNT; ++i) {
+            if (UnitsManager_TeamInfo[i].team_type == TEAM_TYPE_REMOTE) {
+                checksums += std::format(", team {} {:04X}", i, Remote_TeamDataCrc16[i]);
+            }
+        }
+
+        SDL_Log("Desync check failed, unit checksums: %s.", checksums.c_str());
+    }
+
+    return result;
 }
 
 void Remote_SendNetPacket_Signal(int32_t packet_type, int32_t team, uint8_t parameter) {
