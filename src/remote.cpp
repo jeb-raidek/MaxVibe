@@ -23,6 +23,7 @@
 
 #include <filesystem>
 #include <format>
+#include <deque>
 #include <string_view>
 #include <utility>
 
@@ -156,6 +157,13 @@ static int32_t Remote_P53_PendingTurn[TRANSPORT_MAX_TEAM_COUNT];
 static bool Remote_P53_PendingValid[TRANSPORT_MAX_TEAM_COUNT];
 static NetPacket Remote_P53_PendingPackets[TRANSPORT_MAX_TEAM_COUNT];
 
+/* After its complex totals the owner spawns the new units of its team and may issue orders right away, e.g. halt a
+ * factory. Peers must not apply these orders before they spawned the new units of that team themselves, so packets
+ * of the owner are held back from its complex totals until the peer progressed the build state of the team.
+ */
+static bool Remote_P53_Holding[TRANSPORT_MAX_TEAM_COUNT];
+static std::deque<NetPacket> Remote_P53_HeldPackets[TRANSPORT_MAX_TEAM_COUNT];
+
 static OrderProcessor Remote_OrderProcessors[ORDER_COUNT_MAX];
 
 static uint16_t Remote_GenerateEntityId();
@@ -243,6 +251,10 @@ static void Remote_ReceiveNetPacket_50(NetPacket& packet);
 static void Remote_ReceiveNetPacket_51(NetPacket& packet);
 static void Remote_ReceiveNetPacket_52(NetPacket& packet);
 static void Remote_ReceiveNetPacket_53(NetPacket& packet);
+
+static int32_t Remote_GetSenderTeam(NetPacket& packet);
+static void Remote_DispatchNetPacket(NetPacket& packet);
+static void Remote_ClearHeldPackets(uint16_t team);
 
 uint16_t Remote_GenerateEntityId() {
     uint16_t new_entity_id;
@@ -620,6 +632,10 @@ void Remote_ResponseTimeout(uint16_t team, bool mode) {
 
     UnitsManager_TeamInfo[team].team_type = TEAM_TYPE_ELIMINATED;
 
+    if (team < TRANSPORT_MAX_TEAM_COUNT) {
+        Remote_ClearHeldPackets(team);
+    }
+
     if (team < TRANSPORT_MAX_TEAM_COUNT && Remote_TeamNodeIds[team]) {
         if (Remote_Nodes.Find(Remote_TeamNodeIds[team])) {
             Remote_Nodes.Remove(Remote_TeamNodeIds[team]);
@@ -674,6 +690,7 @@ void Remote_Init() {
         Remote_P12_PendingPackets[i].Reset();
         Remote_P53_PendingValid[i] = false;
         Remote_P53_PendingPackets[i].Reset();
+        Remote_ClearHeldPackets(i);
         Remote_FrameSyncCounter2values[i] = 0;
         Remote_FrameSyncCounter[i] = 0;
         Remote_NextTurnIndices[i] = 0;
@@ -1094,10 +1111,55 @@ void Remote_UnregisterMenu() { Remote_NetworkMenu = nullptr; }
 
 bool Remote_TransportFailed() { return Remote_Transport && Remote_Transport->GetStatus().IsFatal(); }
 
+int32_t Remote_GetSenderTeam(NetPacket& packet) {
+    if (packet.GetAddressCount() > 0) {
+        const NetNode* const node = Remote_Nodes.Find(packet.GetAddress(0));
+
+        if (node) {
+            for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+                if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE &&
+                    Remote_TeamNodeIds[team] == node->entity_id) {
+                    return team;
+                }
+            }
+        }
+    }
+
+    return -1;
+}
+
+void Remote_ClearHeldPackets(uint16_t team) {
+    Remote_P53_Holding[team] = false;
+    Remote_P53_HeldPackets[team].clear();
+}
+
+void Remote_ReleaseHeldPackets(uint16_t team) {
+    Remote_P53_Holding[team] = false;
+
+    /* a released packet may start holding again, the remaining ones then stay queued in order */
+    while (!Remote_P53_Holding[team] && !Remote_P53_HeldPackets[team].empty()) {
+        NetPacket packet = std::move(Remote_P53_HeldPackets[team].front());
+
+        Remote_P53_HeldPackets[team].pop_front();
+
+        Remote_DispatchNetPacket(packet);
+    }
+}
+
+void Remote_ReleaseAllHeldPackets() {
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+        if (Remote_P53_Holding[team] || !Remote_P53_HeldPackets[team].empty()) {
+            AILOG(log, "Remote: Releasing {} held packets of team {} late.\n", Remote_P53_HeldPackets[team].size(),
+                  team);
+
+            Remote_ReleaseHeldPackets(team);
+        }
+    }
+}
+
 void Remote_ProcessNetPackets() {
     for (;;) {
         NetPacket packet;
-        uint8_t packet_type;
 
         const uint8_t receive_status = Remote_ReceivePacket(packet);
 
@@ -1109,6 +1171,24 @@ void Remote_ProcessNetPackets() {
             continue;
         }
 
+        const int32_t sender_team = Remote_GetSenderTeam(packet);
+
+        /* frame synchronization signals carry no game state and blocking synchronization waits on them */
+        if (sender_team >= 0 && Remote_P53_Holding[sender_team] &&
+            static_cast<uint8_t>(packet.GetBuffer()[0]) != REMOTE_PACKET_01) {
+            Remote_P53_HeldPackets[sender_team].push_back(std::move(packet));
+
+            continue;
+        }
+
+        Remote_DispatchNetPacket(packet);
+    }
+}
+
+void Remote_DispatchNetPacket(NetPacket& packet) {
+    uint8_t packet_type;
+
+    {
         {
             packet >> packet_type;
 
@@ -1303,7 +1383,7 @@ void Remote_ProcessNetPackets() {
                       packet_type - TRANSPORT_APPL_PACKET_ID);
             }
         }
-    };
+    }
 }
 
 void Remote_NetErrorUnknownUnit(uint16_t unit_id) {
@@ -3875,6 +3955,10 @@ void Remote_ReceiveNetPacket_53(NetPacket& packet) {
     Remote_P53_PendingPackets[entity_id].Write(packet.GetBuffer(), packet.GetDataSize());
     Remote_P53_PendingTurn[entity_id] = turn;
     Remote_P53_PendingValid[entity_id] = true;
+
+    if (UnitsManager_TeamInfo[entity_id].team_type == TEAM_TYPE_REMOTE) {
+        Remote_P53_Holding[entity_id] = true;
+    }
 }
 
 void Remote_WaitComplexTotals(uint16_t team) {

@@ -2396,6 +2396,9 @@ bool GameManager_CheckDesync() {
     if (Remote_IsNetworkGame) {
         uint16_t crc_checksum;
 
+        /* every peer has progressed the build state of all teams by now */
+        Remote_ReleaseAllHeldPackets();
+
         crc_checksum = 0xFFFF;
 
         for (int32_t team = PLAYER_TEAM_RED; team < PLAYER_TEAM_MAX; ++team) {
@@ -8201,6 +8204,11 @@ void GameManager_ProgressBuildState(uint16_t team) {
     for (auto it = complexes.Begin(), it_end = complexes.End(); it != it_end; ++it) {
         Access_UpdateResourcesTotal(it->Get());
         GameManager_OptimizeProduction(team, it->Get(), false, true);
+    }
+
+    /* the owner may have issued orders after it spawned the new units, these are applied only now */
+    if (Remote_IsNetworkGame && UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+        Remote_ReleaseHeldPackets(team);
     }
 
     GameManager_GameState = GAME_STATE_8_IN_GAME;
