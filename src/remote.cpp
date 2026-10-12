@@ -35,6 +35,7 @@
 #include "ailog.hpp"
 #include "cursor.hpp"
 #include "game_manager.hpp"
+#include "gfx.hpp"
 #include "hash.hpp"
 #include "helpmenu.hpp"
 #include "menu.hpp"
@@ -174,6 +175,8 @@ static std::deque<NetPacket> Remote_P53_HeldPackets[TRANSPORT_MAX_TEAM_COUNT];
  */
 static uint8_t Remote_StateSyncIndex;
 static uint8_t Remote_StateSyncIndices[TRANSPORT_MAX_TEAM_COUNT];
+static uint8_t Remote_StateSyncReceivingIndices[TRANSPORT_MAX_TEAM_COUNT];
+static std::vector<uint16_t> Remote_StateSyncUnitIds[TRANSPORT_MAX_TEAM_COUNT];
 
 static OrderProcessor Remote_OrderProcessors[ORDER_COUNT_MAX];
 
@@ -266,6 +269,7 @@ static void Remote_ReceiveNetPacket_54(NetPacket& packet);
 static void Remote_ReadPacket23Data(struct Packet23Data& data, NetPacket& packet);
 
 static int32_t Remote_GetSenderTeam(NetPacket& packet);
+static bool Remote_RelocateUnit(UnitInfo* unit, int16_t grid_x, int16_t grid_y);
 static void Remote_DispatchNetPacket(NetPacket& packet);
 static void Remote_ClearHeldPackets(uint16_t team);
 
@@ -706,6 +710,8 @@ void Remote_Init() {
         Remote_P53_PendingPackets[i].Reset();
         Remote_ClearHeldPackets(i);
         Remote_StateSyncIndices[i] = 0;
+        Remote_StateSyncReceivingIndices[i] = 0;
+        Remote_StateSyncUnitIds[i].clear();
         Remote_FrameSyncCounter2values[i] = 0;
         Remote_FrameSyncCounter[i] = 0;
         Remote_NextTurnIndices[i] = 0;
@@ -1141,6 +1147,62 @@ int32_t Remote_GetSenderTeam(NetPacket& packet) {
     }
 
     return -1;
+}
+
+/* Peers replay the moves of remote units at their own pace, and a replay may end or start elsewhere than on the owner,
+ * e.g. when the owner announces the end of a move before the replay finished. Positions drive combat, so a unit is moved
+ * to the cell its owner reports. Only mobile units that rest within a single cell on the map are relocated.
+ */
+bool Remote_RelocateUnit(UnitInfo* unit, int16_t grid_x, int16_t grid_y) {
+    if (unit->grid_x == grid_x && unit->grid_y == grid_y) {
+        return true;
+    }
+
+    /* the owner decides where its units are, a peer never relocates units of the local team */
+    if (UnitsManager_TeamInfo[unit->team].team_type != TEAM_TYPE_REMOTE) {
+        return false;
+    }
+
+    if ((unit->flags & (STATIONARY | GROUND_COVER)) || unit->in_transit || grid_x < 0 || grid_y < 0 ||
+        grid_x >= ResourceManager_MapSize.x || grid_y >= ResourceManager_MapSize.y) {
+        return false;
+    }
+
+    bool is_on_map = false;
+
+    if (const auto units = Hash_MapHash[Point(unit->grid_x, unit->grid_y)]) {
+        for (auto it = units->Begin(), it_end = units->End(); it != it_end; ++it) {
+            if (it->Get() == unit) {
+                is_on_map = true;
+                break;
+            }
+        }
+    }
+
+    if (!is_on_map) {
+        return false;
+    }
+
+    SmartPointer<UnitInfo> copy = unit->MakeCopy();
+
+    unit->RefreshScreen();
+
+    Hash_MapHash.Remove(unit);
+
+    unit->OffsetDrawZones(grid_x * GFX_MAP_TILE_SIZE + GFX_MAP_TILE_SIZE / 2 - unit->x,
+                          grid_y * GFX_MAP_TILE_SIZE + GFX_MAP_TILE_SIZE / 2 - unit->y);
+
+    unit->grid_x = grid_x;
+    unit->grid_y = grid_y;
+
+    Hash_MapHash.Add(unit);
+
+    Access_UpdateMapStatus(unit, true);
+    Access_UpdateMapStatus(&*copy, false);
+
+    unit->RefreshScreen();
+
+    return true;
 }
 
 void Remote_ClearHeldPackets(uint16_t team) {
@@ -3515,6 +3577,8 @@ void Remote_SendNetPacket_38(UnitInfo* unit) {
 
     packet << unit->GetOrder();
     packet << unit->GetOrderState();
+    packet << unit->grid_x;
+    packet << unit->grid_y;
     packet << unit->move_to_grid_x;
     packet << unit->move_to_grid_y;
     packet << unit->group_speed;
@@ -3567,12 +3631,22 @@ void Remote_ReceiveNetPacket_38(NetPacket& packet) {
 
         UnitOrderType order;
         UnitOrderStateType order_state;
+        int16_t grid_x;
+        int16_t grid_y;
 
         packet >> order;
         packet >> order_state;
+        packet >> grid_x;
+        packet >> grid_y;
 
         unit->SetOrder(order);
         unit->SetOrderState(order_state);
+
+        /* the replay of the path has to start where the owner starts it */
+        if (!packet.IsMalformed() && !Remote_RelocateUnit(unit, grid_x, grid_y)) {
+            AILOG(log, "Remote: Unit {} starts a path at [{},{}], owner starts it at [{},{}].\n", entity_id,
+                  unit->grid_x + 1, unit->grid_y + 1, grid_x + 1, grid_y + 1);
+        }
 
         packet >> unit->move_to_grid_x;
         packet >> unit->move_to_grid_y;
@@ -3686,9 +3760,10 @@ void Remote_ReceiveNetPacket_41(NetPacket& packet) {
         unit->shots = shots;
         unit->move_fraction = move_fraction;
 
-        if (unit->grid_x != grid_x || unit->grid_y != grid_y) {
-            AILOG(log, "Remote: Unit {} stopped at [{},{}], owner stopped it at [{},{}].\n", entity_id,
-                  unit->grid_x + 1, unit->grid_y + 1, grid_x + 1, grid_y + 1);
+        /* the replay of the move may not have reached the cell where the owner stopped */
+        if (!Remote_RelocateUnit(unit, grid_x, grid_y)) {
+            SDL_Log("Move correction: unit %X stopped at [%i,%i], owner stopped it at [%i,%i], not relocated.",
+                    entity_id, unit->grid_x + 1, unit->grid_y + 1, grid_x + 1, grid_y + 1);
         }
 
         if (GameManager_SelectedUnit == unit) {
@@ -4070,6 +4145,8 @@ static void Remote_SendUnitStates(uint16_t team, uint8_t sync_index) {
             packet << UnitsManager_TeamInfo[team].team_units->GetGold();
             packet << UnitsManager_TeamInfo[team].stats_gold_spent_on_upgrades;
             packet << UnitsManager_TeamInfo[team].research_topics;
+            packet << UnitsManager_TeamInfo[team].number_of_objects_created;
+            packet << UnitsManager_TeamInfo[team].unit_counters;
         }
 
         Remote_TransmitPacket(packet, REMOTE_MULTICAST);
@@ -4192,8 +4269,12 @@ static void Remote_ApplyUnitState(uint16_t team, uint16_t unit_id, const struct 
     }
 
     if (unit->grid_x != data.grid_x || unit->grid_y != data.grid_y) {
-        changes += std::format(" position [{},{}] differs from owner [{},{}], not corrected", unit->grid_x + 1,
-                               unit->grid_y + 1, data.grid_x + 1, data.grid_y + 1);
+        const int16_t grid_x = unit->grid_x;
+        const int16_t grid_y = unit->grid_y;
+        const bool is_relocated = Remote_RelocateUnit(unit, data.grid_x, data.grid_y);
+
+        changes += std::format(" position [{},{}]->[{},{}]{}", grid_x + 1, grid_y + 1, data.grid_x + 1, data.grid_y + 1,
+                               is_relocated ? "" : " not corrected");
     }
 
     if (!changes.empty()) {
@@ -4203,6 +4284,39 @@ static void Remote_ApplyUnitState(uint16_t team, uint16_t unit_id, const struct 
         if (GameManager_SelectedUnit == unit) {
             GameManager_UpdateInfoDisplay(unit);
         }
+    }
+}
+
+/* Units of a team that its owner does not have, e.g. a unit spawned only on this peer or destroyed only on the owner,
+ * are removed. Buildings are only reported as removing them involves their complex and connections.
+ */
+static void Remote_RemoveExtraUnits(uint16_t team, std::vector<uint16_t>& owner_unit_ids) {
+    SmartList<UnitInfo>* const unit_lists[] = {&UnitsManager_GroundCoverUnits, &UnitsManager_MobileLandSeaUnits,
+                                               &UnitsManager_StationaryUnits, &UnitsManager_MobileAirUnits};
+    std::vector<SmartPointer<UnitInfo>> extra_units;
+
+    std::sort(owner_unit_ids.begin(), owner_unit_ids.end());
+
+    for (auto list : unit_lists) {
+        for (auto it = list->Begin(), it_end = list->End(); it != it_end; ++it) {
+            if ((*it).team == team && (*it).GetId() != 0xFFFF && !((*it).flags & EXPLODING) &&
+                !std::binary_search(owner_unit_ids.begin(), owner_unit_ids.end(), (*it).GetId())) {
+                if ((*it).flags & (STATIONARY | GROUND_COVER)) {
+                    SDL_Log("Desync correction: team %i \"%s\" %X does not exist on its owner, not removed.", team,
+                            ResourceManager_GetUnit((*it).GetUnitType()).GetSingularName().data(), (*it).GetId());
+
+                } else {
+                    extra_units.push_back(SmartPointer<UnitInfo>(it->Get()));
+                }
+            }
+        }
+    }
+
+    for (auto& unit : extra_units) {
+        SDL_Log("Desync correction: team %i \"%s\" %X does not exist on its owner, removed.", team,
+                ResourceManager_GetUnit(unit->GetUnitType()).GetSingularName().data(), unit->GetId());
+
+        UnitsManager_DestroyUnit(unit.Get(), false);
     }
 }
 
@@ -4238,6 +4352,11 @@ void Remote_ReceiveNetPacket_54(NetPacket& packet) {
         return;
     }
 
+    if (Remote_StateSyncReceivingIndices[entity_id] != sync_index) {
+        Remote_StateSyncReceivingIndices[entity_id] = sync_index;
+        Remote_StateSyncUnitIds[entity_id].clear();
+    }
+
     for (uint16_t i = 0; i < count; ++i) {
         struct Packet23Data data;
         uint16_t unit_id;
@@ -4250,6 +4369,8 @@ void Remote_ReceiveNetPacket_54(NetPacket& packet) {
             return;
         }
 
+        Remote_StateSyncUnitIds[entity_id].push_back(unit_id);
+
         Remote_ApplyUnitState(entity_id, unit_id, data);
     }
 
@@ -4257,14 +4378,34 @@ void Remote_ReceiveNetPacket_54(NetPacket& packet) {
         uint32_t gold;
         uint32_t gold_spent_on_upgrades;
         ResearchTopic research_topics[RESEARCH_TOPIC_COUNT];
+        uint16_t number_of_objects_created;
+        uint32_t unit_counters[UNIT_END];
 
         packet >> gold;
         packet >> gold_spent_on_upgrades;
         packet >> research_topics;
+        packet >> number_of_objects_created;
+        packet >> unit_counters;
 
         if (packet.IsMalformed()) {
             return;
         }
+
+        /* the counters assign the ids of new units, peers that diverge here would address different units later */
+        CTInfo& team_info = UnitsManager_TeamInfo[entity_id];
+
+        if (team_info.number_of_objects_created != number_of_objects_created ||
+            memcmp(team_info.unit_counters, unit_counters, sizeof(unit_counters))) {
+            SDL_Log("Desync correction: team %i unit counters, objects created %i->%i", entity_id,
+                    team_info.number_of_objects_created, number_of_objects_created);
+
+            team_info.number_of_objects_created = number_of_objects_created;
+            memcpy(team_info.unit_counters, unit_counters, sizeof(unit_counters));
+        }
+
+        Remote_RemoveExtraUnits(entity_id, Remote_StateSyncUnitIds[entity_id]);
+
+        Remote_StateSyncUnitIds[entity_id].clear();
 
         TeamUnits* const team_units = UnitsManager_TeamInfo[entity_id].team_units;
 
