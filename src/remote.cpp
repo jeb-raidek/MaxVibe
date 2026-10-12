@@ -3536,20 +3536,61 @@ void Remote_SendNetPacket_41(UnitInfo* unit, bool mode) {
     packet << static_cast<uint16_t>(unit->GetId());
     packet << mode;
 
+    packet << unit->grid_x;
+    packet << unit->grid_y;
+    packet << unit->speed;
+    packet << unit->group_speed;
+    packet << unit->shots;
+    packet << unit->move_fraction;
+
     Remote_TransmitPacket(packet, REMOTE_MULTICAST);
 }
 
 void Remote_ReceiveNetPacket_41(NetPacket& packet) {
     uint16_t entity_id;
     bool mode;
+    int16_t grid_x;
+    int16_t grid_y;
+    uint16_t speed;
+    uint16_t group_speed;
+    uint8_t shots;
+    uint8_t move_fraction;
 
     packet >> entity_id;
     packet >> mode;
+
+    packet >> grid_x;
+    packet >> grid_y;
+    packet >> speed;
+    packet >> group_speed;
+    packet >> shots;
+    packet >> move_fraction;
+
+    if (packet.IsMalformed()) {
+        return;
+    }
 
     UnitInfo* unit = Hash_UnitHash[entity_id];
 
     if (unit) {
         unit->BlockedOnPathRequest(mode, true);
+
+        /* The local replay of the move may still lack its final steps when the owner announces the end of the move,
+         * so the movement points are taken over from the owner.
+         */
+        unit->speed = speed;
+        unit->group_speed = group_speed;
+        unit->shots = shots;
+        unit->move_fraction = move_fraction;
+
+        if (unit->grid_x != grid_x || unit->grid_y != grid_y) {
+            AILOG(log, "Remote: Unit {} stopped at [{},{}], owner stopped it at [{},{}].\n", entity_id,
+                  unit->grid_x + 1, unit->grid_y + 1, grid_x + 1, grid_y + 1);
+        }
+
+        if (GameManager_SelectedUnit == unit) {
+            GameManager_UpdateInfoDisplay(unit);
+        }
 
     } else {
         Remote_NetErrorUnknownUnit(entity_id);
