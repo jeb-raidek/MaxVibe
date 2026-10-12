@@ -82,6 +82,7 @@ enum : uint8_t {
     REMOTE_PACKET_50,
     REMOTE_PACKET_51,
     REMOTE_PACKET_52,
+    REMOTE_PACKET_53,
 };
 
 void Remote_Deinit();
@@ -103,6 +104,7 @@ int32_t Remote_SiteSelectMenu();
 void Remote_LeaveGame(uint16_t team, bool mode);
 [[nodiscard]] bool Remote_DelayedReactionsSyncStalled();
 bool Remote_CheckDesync(uint16_t team, uint16_t crc_checksum);
+void Remote_WaitComplexTotals(uint16_t team);
 
 void Remote_SendNetPacket_Signal(int32_t packet_type, int32_t team, uint8_t parameter);
 void Remote_SendNetPacket_05(int32_t team);
@@ -133,6 +135,7 @@ void Remote_SendNetPacket_43(UnitInfo* unit, const char* name);
 void Remote_SendNetPacket_44(NetAddress& address);
 void Remote_SendNetPacket_46(uint16_t team, bool state, uint32_t counter);
 void Remote_SendNetPacket_50(UnitInfo* unit);
+void Remote_SendNetPacket_53(int32_t team);
 
 extern uint8_t Remote_GameState;
 extern bool Remote_IsHostMode;

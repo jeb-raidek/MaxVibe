@@ -147,6 +147,15 @@ static uint8_t Remote_P12_PendingRound[TRANSPORT_MAX_TEAM_COUNT];
 static bool Remote_P12_PendingValid[TRANSPORT_MAX_TEAM_COUNT];
 static NetPacket Remote_P12_PendingPackets[TRANSPORT_MAX_TEAM_COUNT];
 
+/* Only the owner of a team optimizes the production of its complexes at the beginning of a turn, peers replicate the
+ * resulting orders. The complex totals that the turn start production distributes into storage buildings depend on
+ * those orders, so peers wait for the totals of the owner instead of using their own, not yet optimized ones. The
+ * owner may run ahead of a peer by one turn start, so a single pending packet per team suffices.
+ */
+static int32_t Remote_P53_PendingTurn[TRANSPORT_MAX_TEAM_COUNT];
+static bool Remote_P53_PendingValid[TRANSPORT_MAX_TEAM_COUNT];
+static NetPacket Remote_P53_PendingPackets[TRANSPORT_MAX_TEAM_COUNT];
+
 static OrderProcessor Remote_OrderProcessors[ORDER_COUNT_MAX];
 
 static uint16_t Remote_GenerateEntityId();
@@ -233,6 +242,7 @@ static void Remote_ReceiveNetPacket_49(NetPacket& packet);
 static void Remote_ReceiveNetPacket_50(NetPacket& packet);
 static void Remote_ReceiveNetPacket_51(NetPacket& packet);
 static void Remote_ReceiveNetPacket_52(NetPacket& packet);
+static void Remote_ReceiveNetPacket_53(NetPacket& packet);
 
 uint16_t Remote_GenerateEntityId() {
     uint16_t new_entity_id;
@@ -662,6 +672,8 @@ void Remote_Init() {
     for (int32_t i = 0; i < TRANSPORT_MAX_TEAM_COUNT; ++i) {
         Remote_P12_PendingValid[i] = false;
         Remote_P12_PendingPackets[i].Reset();
+        Remote_P53_PendingValid[i] = false;
+        Remote_P53_PendingPackets[i].Reset();
         Remote_FrameSyncCounter2values[i] = 0;
         Remote_FrameSyncCounter[i] = 0;
         Remote_NextTurnIndices[i] = 0;
@@ -1275,6 +1287,10 @@ void Remote_ProcessNetPackets() {
 
                 case REMOTE_PACKET_52: {
                     Remote_ReceiveNetPacket_52(packet);
+                } break;
+
+                case REMOTE_PACKET_53: {
+                    Remote_ReceiveNetPacket_53(packet);
                 } break;
 
                 default: {
@@ -3779,4 +3795,90 @@ void Remote_ReceiveNetPacket_52(NetPacket& packet) {
     }
 
     packet >> Remote_TurnIndices[entity_id];
+}
+
+void Remote_SendNetPacket_53(int32_t team) {
+    TeamUnits* const team_units = UnitsManager_TeamInfo[team].team_units;
+    const auto& complexes = team_units->GetComplexes();
+    NetPacket packet;
+
+    packet << static_cast<uint8_t>(REMOTE_PACKET_53);
+    packet << static_cast<uint16_t>(team);
+    packet << GameManager_TurnCounter;
+    packet << static_cast<uint16_t>(complexes.GetCount());
+
+    for (auto it = complexes.Begin(), it_end = complexes.End(); it != it_end; ++it) {
+        team_units->WriteComplexPacket((*it).GetId(), packet);
+    }
+
+    Remote_TransmitPacket(packet, REMOTE_MULTICAST);
+}
+
+void Remote_ReceiveNetPacket_53(NetPacket& packet) {
+    uint16_t entity_id;
+    int32_t turn;
+
+    packet >> entity_id;
+
+    if (!Remote_IsValidTeamIndex(packet, entity_id)) {
+        return;
+    }
+
+    packet >> turn;
+
+    if (packet.IsMalformed()) {
+        return;
+    }
+
+    Remote_P53_PendingPackets[entity_id].Reset();
+    Remote_P53_PendingPackets[entity_id].Write(packet.GetBuffer(), packet.GetDataSize());
+    Remote_P53_PendingTurn[entity_id] = turn;
+    Remote_P53_PendingValid[entity_id] = true;
+}
+
+void Remote_WaitComplexTotals(uint16_t team) {
+    const auto is_pending = [team]() {
+        return Remote_P53_PendingValid[team] && Remote_P53_PendingTurn[team] == GameManager_TurnCounter;
+    };
+
+    uint64_t time_stamp_timeout = timer_get();
+
+    bool is_indicator_drawn = false;
+
+    while (Remote_IsNetworkGame && UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE && !is_pending()) {
+        Remote_UiProcessTick(true);
+
+        if (!is_pending()) {
+            if (timer_elapsed_time(time_stamp_timeout) > REMOTE_RESPONSE_TIMEOUT) {
+                Remote_ResponseTimeout(team, true);
+            }
+
+            is_indicator_drawn = Remote_DrawBarrierWaitIndicator(is_indicator_drawn, time_stamp_timeout);
+        }
+
+        /* Pump the event queue, but discard the input: a synchronization barrier cannot be
+         * escaped and must not let the player issue commands while peers catch up.
+         */
+        get_input();
+    }
+
+    Remote_ClearBarrierWaitIndicator(is_indicator_drawn);
+
+    if (is_pending()) {
+        NetPacket& packet = Remote_P53_PendingPackets[team];
+        uint16_t complex_count;
+
+        packet >> complex_count;
+
+        for (uint16_t i = 0; i < complex_count && !packet.IsMalformed(); ++i) {
+            UnitsManager_TeamInfo[team].team_units->ReadComplexPacket(packet);
+        }
+
+        if (packet.IsMalformed()) {
+            AILOG(log, "Remote: Complex totals of team {} are malformed.\n", team);
+        }
+    }
+
+    Remote_P53_PendingValid[team] = false;
+    Remote_P53_PendingPackets[team].Reset();
 }

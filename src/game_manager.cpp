@@ -2027,6 +2027,19 @@ void GameManager_ResupplyUnits(uint16_t team, SmartList<UnitInfo>* units) {
 void GameManager_ManageEconomy(uint16_t team) {
     UnitsManager_TeamInfo[team].team_units->OptimizeComplexes(team);
 
+    /* Only the owner optimizes the production of its complexes, so the storage buildings must be refilled from the
+     * complex totals of the owner on every peer. The owner transmits its totals after the replicated orders, and
+     * peers apply both before they distribute the totals.
+     */
+    if (Remote_IsNetworkGame) {
+        if (team == GameManager_PlayerTeam) {
+            Remote_SendNetPacket_53(team);
+
+        } else if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+            Remote_WaitComplexTotals(team);
+        }
+    }
+
     GameManager_UpdateProductions(team, &UnitsManager_MobileLandSeaUnits);
     GameManager_UpdateProductions(team, &UnitsManager_StationaryUnits);
     GameManager_UpdateProductions(team, &UnitsManager_MobileAirUnits);

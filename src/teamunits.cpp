@@ -135,6 +135,11 @@ void TeamUnits::ReadComplexPacket(NetPacket& packet) {
         complex->ReadPacket(packet);
 
     } else {
+        /* consume the totals so that further complexes in the same packet stay aligned */
+        Complex unknown_complex(complex_id);
+
+        unknown_complex.ReadPacket(packet);
+
         AILOG(log, "Complex {} is unknown, ignoring its remote update.\n", complex_id);
     }
 }
