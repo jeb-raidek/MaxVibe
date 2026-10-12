@@ -2399,6 +2399,9 @@ bool GameManager_CheckDesync() {
         /* every peer has progressed the build state of all teams by now */
         Remote_ReleaseAllHeldPackets();
 
+        /* peers take over the state of the units of every owner, the checksums then verify the result */
+        Remote_SynchronizeUnitStates();
+
         crc_checksum = 0xFFFF;
 
         for (int32_t team = PLAYER_TEAM_RED; team < PLAYER_TEAM_MAX; ++team) {

@@ -83,6 +83,7 @@ enum : uint8_t {
     REMOTE_PACKET_51,
     REMOTE_PACKET_52,
     REMOTE_PACKET_53,
+    REMOTE_PACKET_54,
 };
 
 void Remote_Deinit();
@@ -107,6 +108,7 @@ bool Remote_CheckDesync(uint16_t team, uint16_t crc_checksum);
 void Remote_WaitComplexTotals(uint16_t team);
 void Remote_ReleaseHeldPackets(uint16_t team);
 void Remote_ReleaseAllHeldPackets();
+void Remote_SynchronizeUnitStates();
 
 void Remote_SendNetPacket_Signal(int32_t packet_type, int32_t team, uint8_t parameter);
 void Remote_SendNetPacket_05(int32_t team);

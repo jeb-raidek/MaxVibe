@@ -23,9 +23,13 @@
 
 #include <filesystem>
 #include <format>
+#include <algorithm>
+#include <cstring>
 #include <deque>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "access.hpp"
 #include "ailog.hpp"
@@ -164,6 +168,13 @@ static NetPacket Remote_P53_PendingPackets[TRANSPORT_MAX_TEAM_COUNT];
 static bool Remote_P53_Holding[TRANSPORT_MAX_TEAM_COUNT];
 static std::deque<NetPacket> Remote_P53_HeldPackets[TRANSPORT_MAX_TEAM_COUNT];
 
+/* Peers replay the actions of remote teams, but nothing guarantees that a replicated change lands at the same point of
+ * the game on every peer. At every desync check each owner therefore transmits the authoritative state of its units,
+ * and peers take it over before the checksums are compared. The sync index identifies the check on all peers.
+ */
+static uint8_t Remote_StateSyncIndex;
+static uint8_t Remote_StateSyncIndices[TRANSPORT_MAX_TEAM_COUNT];
+
 static OrderProcessor Remote_OrderProcessors[ORDER_COUNT_MAX];
 
 static uint16_t Remote_GenerateEntityId();
@@ -251,6 +262,8 @@ static void Remote_ReceiveNetPacket_50(NetPacket& packet);
 static void Remote_ReceiveNetPacket_51(NetPacket& packet);
 static void Remote_ReceiveNetPacket_52(NetPacket& packet);
 static void Remote_ReceiveNetPacket_53(NetPacket& packet);
+static void Remote_ReceiveNetPacket_54(NetPacket& packet);
+static void Remote_ReadPacket23Data(struct Packet23Data& data, NetPacket& packet);
 
 static int32_t Remote_GetSenderTeam(NetPacket& packet);
 static void Remote_DispatchNetPacket(NetPacket& packet);
@@ -684,6 +697,7 @@ void Remote_Init() {
     Remote_RemotePlayerCount = 0;
     Remote_P51_Signal = false;
     Remote_SiteSelectRound = 0;
+    Remote_StateSyncIndex = 0;
 
     for (int32_t i = 0; i < TRANSPORT_MAX_TEAM_COUNT; ++i) {
         Remote_P12_PendingValid[i] = false;
@@ -691,6 +705,7 @@ void Remote_Init() {
         Remote_P53_PendingValid[i] = false;
         Remote_P53_PendingPackets[i].Reset();
         Remote_ClearHeldPackets(i);
+        Remote_StateSyncIndices[i] = 0;
         Remote_FrameSyncCounter2values[i] = 0;
         Remote_FrameSyncCounter[i] = 0;
         Remote_NextTurnIndices[i] = 0;
@@ -1371,6 +1386,10 @@ void Remote_DispatchNetPacket(NetPacket& packet) {
 
                 case REMOTE_PACKET_53: {
                     Remote_ReceiveNetPacket_53(packet);
+                } break;
+
+                case REMOTE_PACKET_54: {
+                    Remote_ReceiveNetPacket_54(packet);
                 } break;
 
                 default: {
@@ -2993,41 +3012,45 @@ void Remote_ProcessNetPacket_23(struct Packet23Data& data, NetPacket& packet) {
     local >> packet_type;
     local >> entity_id;
 
-    local >> data.orders;
-    local >> data.state;
-    local >> data.prior_orders;
-    local >> data.prior_state;
-    local >> data.disabled_reaction_fire;
+    Remote_ReadPacket23Data(data, local);
+}
 
-    local >> data.parent_unit_id;
-    local >> data.experience;
+void Remote_ReadPacket23Data(struct Packet23Data& data, NetPacket& packet) {
+    packet >> data.orders;
+    packet >> data.state;
+    packet >> data.prior_orders;
+    packet >> data.prior_state;
+    packet >> data.disabled_reaction_fire;
 
-    local >> data.move_to_grid_x;
-    local >> data.move_to_grid_y;
-    local >> data.fire_on_grid_x;
-    local >> data.fire_on_grid_y;
-    local >> data.enemy_unit_id;
+    packet >> data.parent_unit_id;
+    packet >> data.experience;
 
-    local >> data.transfer_cargo;
-    local >> data.stealth_dice_roll;
+    packet >> data.move_to_grid_x;
+    packet >> data.move_to_grid_y;
+    packet >> data.fire_on_grid_x;
+    packet >> data.fire_on_grid_y;
+    packet >> data.enemy_unit_id;
 
-    local >> data.total_mining;
-    local >> data.raw_mining;
-    local >> data.fuel_mining;
-    local >> data.gold_mining;
+    packet >> data.transfer_cargo;
+    packet >> data.stealth_dice_roll;
 
-    local >> data.build_time;
-    local >> data.build_rate;
-    local >> data.unit_type;
-    local >> data.unit_id;
-    local >> data.grid_x;
-    local >> data.grid_y;
-    local >> data.team;
-    local >> data.hits;
-    local >> data.speed;
-    local >> data.shots;
-    local >> data.storage;
-    local >> data.ammo;
+    packet >> data.total_mining;
+    packet >> data.raw_mining;
+    packet >> data.fuel_mining;
+    packet >> data.gold_mining;
+
+    packet >> data.build_time;
+    packet >> data.build_rate;
+    packet >> data.unit_type;
+    packet >> data.unit_id;
+    packet >> data.grid_x;
+    packet >> data.grid_y;
+    packet >> data.team;
+    packet >> data.hits;
+    packet >> data.speed;
+    packet >> data.shots;
+    packet >> data.storage;
+    packet >> data.ammo;
 }
 
 void Remote_SendNetPacket_23(UnitInfo* unit) {
@@ -4006,4 +4029,307 @@ void Remote_WaitComplexTotals(uint16_t team) {
 
     Remote_P53_PendingValid[team] = false;
     Remote_P53_PendingPackets[team].Reset();
+}
+
+static void Remote_SendUnitStates(uint16_t team, uint8_t sync_index) {
+    constexpr size_t units_per_packet = 32;
+    SmartList<UnitInfo>* const unit_lists[] = {&UnitsManager_GroundCoverUnits, &UnitsManager_MobileLandSeaUnits,
+                                               &UnitsManager_StationaryUnits, &UnitsManager_MobileAirUnits};
+    std::vector<UnitInfo*> units;
+
+    for (auto list : unit_lists) {
+        for (auto it = list->Begin(), it_end = list->End(); it != it_end; ++it) {
+            if ((*it).team == team && (*it).GetId() != 0xFFFF && !((*it).flags & EXPLODING)) {
+                units.push_back(it->Get());
+            }
+        }
+    }
+
+    size_t index = 0;
+
+    do {
+        const uint16_t count = static_cast<uint16_t>(std::min(units_per_packet, units.size() - index));
+        const bool is_last = index + count >= units.size();
+        NetPacket packet;
+
+        packet << static_cast<uint8_t>(REMOTE_PACKET_54);
+        packet << team;
+        packet << sync_index;
+        packet << is_last;
+        packet << count;
+
+        for (uint16_t i = 0; i < count; ++i) {
+            UnitInfo* const unit = units[index + i];
+
+            packet << unit->GetId();
+
+            Remote_CreateNetPacket_23(unit, packet);
+        }
+
+        if (is_last) {
+            packet << UnitsManager_TeamInfo[team].team_units->GetGold();
+            packet << UnitsManager_TeamInfo[team].stats_gold_spent_on_upgrades;
+            packet << UnitsManager_TeamInfo[team].research_topics;
+        }
+
+        Remote_TransmitPacket(packet, REMOTE_MULTICAST);
+
+        index += count;
+
+    } while (index < units.size());
+}
+
+static void Remote_ApplyUnitState(uint16_t team, uint16_t unit_id, const struct Packet23Data& data) {
+    UnitInfo* const unit = Hash_UnitHash[unit_id];
+
+    if (!unit) {
+        SDL_Log("Desync correction: unit %X of team %i does not exist locally.", unit_id, team);
+
+        return;
+    }
+
+    if (unit->team != team || unit->GetUnitType() != data.unit_type) {
+        SDL_Log("Desync correction: unit %X is of team %i type %i locally, of team %i type %i on its owner.", unit_id,
+                unit->team, unit->GetUnitType(), team, data.unit_type);
+
+        return;
+    }
+
+    if (unit->flags & EXPLODING) {
+        return;
+    }
+
+    if (data.orders >= ORDER_COUNT_MAX || data.prior_orders >= ORDER_COUNT_MAX) {
+        SDL_Log("Desync correction: unit %X has out of range orders on its owner.", unit_id);
+
+        return;
+    }
+
+    std::string changes;
+
+    const auto take_over = [&changes](const char* name, auto& local, const auto remote) {
+        if (local != remote) {
+            changes += std::format(" {} {}->{}", name, static_cast<int32_t>(local), static_cast<int32_t>(remote));
+
+            local = remote;
+        }
+    };
+
+    {
+        auto order = unit->GetOrder();
+        auto state = unit->GetOrderState();
+        auto prior_order = unit->GetPriorOrder();
+        auto prior_state = unit->GetPriorOrderState();
+
+        take_over("order", order, static_cast<UnitOrderType>(data.orders));
+        take_over("state", state, static_cast<UnitOrderStateType>(data.state));
+        take_over("prior_order", prior_order, static_cast<UnitOrderType>(data.prior_orders));
+        take_over("prior_state", prior_state, static_cast<UnitOrderStateType>(data.prior_state));
+
+        unit->SetOrder(order);
+        unit->SetOrderState(state);
+        unit->SetPriorOrder(prior_order);
+        unit->SetPriorOrderState(prior_state);
+    }
+
+    take_over("disabled_reaction_fire", unit->disabled_reaction_fire, data.disabled_reaction_fire);
+
+    {
+        const uint16_t parent_id = unit->GetParent() ? unit->GetParent()->GetId() : 0;
+
+        if (parent_id != data.parent_unit_id) {
+            changes += std::format(" parent {:X}->{:X}", parent_id, data.parent_unit_id);
+
+            unit->SetParent(data.parent_unit_id ? Hash_UnitHash[data.parent_unit_id] : nullptr);
+        }
+    }
+
+    {
+        const uint16_t enemy_id = unit->GetEnemy() ? unit->GetEnemy()->GetId() : 0;
+
+        if (enemy_id != data.enemy_unit_id) {
+            changes += std::format(" enemy {:X}->{:X}", enemy_id, data.enemy_unit_id);
+
+            unit->SetEnemy(data.enemy_unit_id ? Hash_UnitHash[data.enemy_unit_id] : nullptr);
+        }
+    }
+
+    take_over("experience", unit->experience, data.experience);
+    take_over("move_to_grid_x", unit->move_to_grid_x, data.move_to_grid_x);
+    take_over("move_to_grid_y", unit->move_to_grid_y, data.move_to_grid_y);
+    take_over("fire_on_grid_x", unit->fire_on_grid_x, data.fire_on_grid_x);
+    take_over("fire_on_grid_y", unit->fire_on_grid_y, data.fire_on_grid_y);
+    take_over("transfer_cargo", unit->transfer_cargo, data.transfer_cargo);
+    take_over("stealth_dice_roll", unit->stealth_dice_roll, data.stealth_dice_roll);
+    take_over("total_mining", unit->total_mining, data.total_mining);
+    take_over("raw_mining", unit->raw_mining, data.raw_mining);
+    take_over("fuel_mining", unit->fuel_mining, data.fuel_mining);
+    take_over("gold_mining", unit->gold_mining, data.gold_mining);
+    take_over("build_time", unit->build_time, data.build_time);
+
+    {
+        uint16_t build_rate = static_cast<uint16_t>(unit->GetBuildRate());
+
+        take_over("build_rate", build_rate, data.build_rate);
+
+        unit->SetBuildRate(build_rate);
+    }
+
+    take_over("unit_id", unit->unit_id, data.unit_id);
+    take_over("hits", unit->hits, data.hits);
+    take_over("speed", unit->speed, data.speed);
+    take_over("shots", unit->shots, data.shots);
+    take_over("ammo", unit->ammo, data.ammo);
+
+    {
+        const auto storage = unit->storage;
+
+        take_over("storage", unit->storage, data.storage);
+
+        if (storage != unit->storage && unit->GetComplex()) {
+            Access_UpdateResourcesTotal(unit->GetComplex());
+        }
+    }
+
+    if (unit->grid_x != data.grid_x || unit->grid_y != data.grid_y) {
+        changes += std::format(" position [{},{}] differs from owner [{},{}], not corrected", unit->grid_x + 1,
+                               unit->grid_y + 1, data.grid_x + 1, data.grid_y + 1);
+    }
+
+    if (!changes.empty()) {
+        SDL_Log("Desync correction: team %i \"%s\" %X:%s", team,
+                ResourceManager_GetUnit(unit->GetUnitType()).GetSingularName().data(), unit_id, changes.c_str());
+
+        if (GameManager_SelectedUnit == unit) {
+            GameManager_UpdateInfoDisplay(unit);
+        }
+    }
+}
+
+void Remote_ReceiveNetPacket_54(NetPacket& packet) {
+    uint16_t entity_id;
+    uint8_t sync_index;
+    bool is_last;
+    uint16_t count;
+
+    packet >> entity_id;
+
+    if (!Remote_IsValidTeamIndex(packet, entity_id)) {
+        return;
+    }
+
+    packet >> sync_index;
+    packet >> is_last;
+    packet >> count;
+
+    if (packet.IsMalformed() || count > NetPacket::MaximumArrayCount) {
+        packet.SetMalformed();
+
+        return;
+    }
+
+    /* only the owner may dictate the state of its units */
+    const int32_t sender_team = Remote_GetSenderTeam(packet);
+
+    if (UnitsManager_TeamInfo[entity_id].team_type != TEAM_TYPE_REMOTE ||
+        (sender_team >= 0 && sender_team != entity_id)) {
+        AILOG(log, "Remote: Ignored unit states of team {} sent by team {}.\n", entity_id, sender_team);
+
+        return;
+    }
+
+    for (uint16_t i = 0; i < count; ++i) {
+        struct Packet23Data data;
+        uint16_t unit_id;
+
+        packet >> unit_id;
+
+        Remote_ReadPacket23Data(data, packet);
+
+        if (packet.IsMalformed()) {
+            return;
+        }
+
+        Remote_ApplyUnitState(entity_id, unit_id, data);
+    }
+
+    if (is_last) {
+        uint32_t gold;
+        uint32_t gold_spent_on_upgrades;
+        ResearchTopic research_topics[RESEARCH_TOPIC_COUNT];
+
+        packet >> gold;
+        packet >> gold_spent_on_upgrades;
+        packet >> research_topics;
+
+        if (packet.IsMalformed()) {
+            return;
+        }
+
+        TeamUnits* const team_units = UnitsManager_TeamInfo[entity_id].team_units;
+
+        if (team_units->GetGold() != gold) {
+            SDL_Log("Desync correction: team %i gold %u->%u", entity_id, team_units->GetGold(), gold);
+
+            team_units->SetGold(gold);
+        }
+
+        UnitsManager_TeamInfo[entity_id].stats_gold_spent_on_upgrades = gold_spent_on_upgrades;
+
+        if (memcmp(UnitsManager_TeamInfo[entity_id].research_topics, research_topics, sizeof(research_topics))) {
+            SDL_Log("Desync correction: team %i research topics", entity_id);
+
+            memcpy(UnitsManager_TeamInfo[entity_id].research_topics, research_topics, sizeof(research_topics));
+        }
+
+        Remote_StateSyncIndices[entity_id] = sync_index;
+    }
+}
+
+void Remote_SynchronizeUnitStates() {
+    ++Remote_StateSyncIndex;
+
+    Remote_SendUnitStates(GameManager_PlayerTeam, Remote_StateSyncIndex);
+
+    const auto is_pending = [](int32_t team) {
+        return UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE &&
+               Remote_StateSyncIndices[team] != Remote_StateSyncIndex;
+    };
+
+    const auto is_any_pending = [&is_pending]() {
+        for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+            if (is_pending(team)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    uint64_t time_stamp_timeout = timer_get();
+
+    bool is_indicator_drawn = false;
+
+    while (Remote_IsNetworkGame && is_any_pending()) {
+        Remote_UiProcessTick(true);
+
+        if (is_any_pending()) {
+            if (timer_elapsed_time(time_stamp_timeout) > REMOTE_RESPONSE_TIMEOUT) {
+                for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+                    if (is_pending(team)) {
+                        Remote_ResponseTimeout(team, true);
+                    }
+                }
+            }
+
+            is_indicator_drawn = Remote_DrawBarrierWaitIndicator(is_indicator_drawn, time_stamp_timeout);
+        }
+
+        /* Pump the event queue, but discard the input: a synchronization barrier cannot be
+         * escaped and must not let the player issue commands while peers catch up.
+         */
+        get_input();
+    }
+
+    Remote_ClearBarrierWaitIndicator(is_indicator_drawn);
 }
