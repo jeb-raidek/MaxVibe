@@ -23,13 +23,19 @@
 
 #include <filesystem>
 #include <format>
+#include <algorithm>
+#include <cstring>
+#include <deque>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "access.hpp"
 #include "ailog.hpp"
 #include "cursor.hpp"
 #include "game_manager.hpp"
+#include "gfx.hpp"
 #include "hash.hpp"
 #include "helpmenu.hpp"
 #include "menu.hpp"
@@ -137,6 +143,41 @@ static bool Remote_P24_Signals[TRANSPORT_MAX_TEAM_COUNT];
 static bool Remote_P49_Signal;
 static bool Remote_P51_Signal;
 
+/* Site selection is negotiated in rounds. Every peer sends its mission supplies once per round and decides on the
+ * same snapshot, otherwise with three or more players a peer that is still waiting for a round could act on supplies
+ * from a later round and the peers would disagree on whether another round is needed. A peer can be at most one
+ * round ahead of the others, so a single pending packet per team suffices.
+ */
+static uint8_t Remote_SiteSelectRound;
+static uint8_t Remote_P12_PendingRound[TRANSPORT_MAX_TEAM_COUNT];
+static bool Remote_P12_PendingValid[TRANSPORT_MAX_TEAM_COUNT];
+static NetPacket Remote_P12_PendingPackets[TRANSPORT_MAX_TEAM_COUNT];
+
+/* Only the owner of a team optimizes the production of its complexes at the beginning of a turn, peers replicate the
+ * resulting orders. The complex totals that the turn start production distributes into storage buildings depend on
+ * those orders, so peers wait for the totals of the owner instead of using their own, not yet optimized ones. The
+ * owner may run ahead of a peer by one turn start, so a single pending packet per team suffices.
+ */
+static int32_t Remote_P53_PendingTurn[TRANSPORT_MAX_TEAM_COUNT];
+static bool Remote_P53_PendingValid[TRANSPORT_MAX_TEAM_COUNT];
+static NetPacket Remote_P53_PendingPackets[TRANSPORT_MAX_TEAM_COUNT];
+
+/* After its complex totals the owner spawns the new units of its team and may issue orders right away, e.g. halt a
+ * factory. Peers must not apply these orders before they spawned the new units of that team themselves, so packets
+ * of the owner are held back from its complex totals until the peer progressed the build state of the team.
+ */
+static bool Remote_P53_Holding[TRANSPORT_MAX_TEAM_COUNT];
+static std::deque<NetPacket> Remote_P53_HeldPackets[TRANSPORT_MAX_TEAM_COUNT];
+
+/* Peers replay the actions of remote teams, but nothing guarantees that a replicated change lands at the same point of
+ * the game on every peer. At every desync check each owner therefore transmits the authoritative state of its units,
+ * and peers take it over before the checksums are compared. The sync index identifies the check on all peers.
+ */
+static uint8_t Remote_StateSyncIndex;
+static uint8_t Remote_StateSyncIndices[TRANSPORT_MAX_TEAM_COUNT];
+static uint8_t Remote_StateSyncReceivingIndices[TRANSPORT_MAX_TEAM_COUNT];
+static std::vector<uint16_t> Remote_StateSyncUnitIds[TRANSPORT_MAX_TEAM_COUNT];
+
 static OrderProcessor Remote_OrderProcessors[ORDER_COUNT_MAX];
 
 static uint16_t Remote_GenerateEntityId();
@@ -167,6 +208,8 @@ static void Remote_AnnounceLeave(uint16_t team, bool mode);
 static bool Remote_AnalyzeDesyncHost(SmartList<UnitInfo>& units);
 static bool Remote_DrawBarrierWaitIndicator(bool is_drawn, uint64_t time_stamp);
 static void Remote_ClearBarrierWaitIndicator(bool is_drawn);
+static void Remote_AdvanceSiteSelectRound();
+static void Remote_ReadMissionSupplies(uint16_t team, NetPacket& packet);
 static void Remote_CreateNetPacket_23(UnitInfo* unit, NetPacket& packet);
 static void Remote_ProcessNetPacket_23(struct Packet23Data& data, NetPacket& packet);
 static void Remote_NetErrorUnknownUnit(uint16_t unit_id);
@@ -221,6 +264,14 @@ static void Remote_ReceiveNetPacket_49(NetPacket& packet);
 static void Remote_ReceiveNetPacket_50(NetPacket& packet);
 static void Remote_ReceiveNetPacket_51(NetPacket& packet);
 static void Remote_ReceiveNetPacket_52(NetPacket& packet);
+static void Remote_ReceiveNetPacket_53(NetPacket& packet);
+static void Remote_ReceiveNetPacket_54(NetPacket& packet);
+static void Remote_ReadPacket23Data(struct Packet23Data& data, NetPacket& packet);
+
+static int32_t Remote_GetSenderTeam(NetPacket& packet);
+static bool Remote_RelocateUnit(UnitInfo* unit, int16_t grid_x, int16_t grid_y);
+static void Remote_DispatchNetPacket(NetPacket& packet);
+static void Remote_ClearHeldPackets(uint16_t team);
 
 uint16_t Remote_GenerateEntityId() {
     uint16_t new_entity_id;
@@ -598,6 +649,10 @@ void Remote_ResponseTimeout(uint16_t team, bool mode) {
 
     UnitsManager_TeamInfo[team].team_type = TEAM_TYPE_ELIMINATED;
 
+    if (team < TRANSPORT_MAX_TEAM_COUNT) {
+        Remote_ClearHeldPackets(team);
+    }
+
     if (team < TRANSPORT_MAX_TEAM_COUNT && Remote_TeamNodeIds[team]) {
         if (Remote_Nodes.Find(Remote_TeamNodeIds[team])) {
             Remote_Nodes.Remove(Remote_TeamNodeIds[team]);
@@ -645,8 +700,18 @@ void Remote_Init() {
     Remote_SendSynchFrame = true;
     Remote_RemotePlayerCount = 0;
     Remote_P51_Signal = false;
+    Remote_SiteSelectRound = 0;
+    Remote_StateSyncIndex = 0;
 
     for (int32_t i = 0; i < TRANSPORT_MAX_TEAM_COUNT; ++i) {
+        Remote_P12_PendingValid[i] = false;
+        Remote_P12_PendingPackets[i].Reset();
+        Remote_P53_PendingValid[i] = false;
+        Remote_P53_PendingPackets[i].Reset();
+        Remote_ClearHeldPackets(i);
+        Remote_StateSyncIndices[i] = 0;
+        Remote_StateSyncReceivingIndices[i] = 0;
+        Remote_StateSyncUnitIds[i].clear();
         Remote_FrameSyncCounter2values[i] = 0;
         Remote_FrameSyncCounter[i] = 0;
         Remote_NextTurnIndices[i] = 0;
@@ -1067,10 +1132,111 @@ void Remote_UnregisterMenu() { Remote_NetworkMenu = nullptr; }
 
 bool Remote_TransportFailed() { return Remote_Transport && Remote_Transport->GetStatus().IsFatal(); }
 
+int32_t Remote_GetSenderTeam(NetPacket& packet) {
+    if (packet.GetAddressCount() > 0) {
+        const NetNode* const node = Remote_Nodes.Find(packet.GetAddress(0));
+
+        if (node) {
+            for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+                if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE &&
+                    Remote_TeamNodeIds[team] == node->entity_id) {
+                    return team;
+                }
+            }
+        }
+    }
+
+    return -1;
+}
+
+/* Peers replay the moves of remote units at their own pace, and a replay may end or start elsewhere than on the owner,
+ * e.g. when the owner announces the end of a move before the replay finished. Positions drive combat, so a unit is moved
+ * to the cell its owner reports. Only mobile units that rest within a single cell on the map are relocated.
+ */
+bool Remote_RelocateUnit(UnitInfo* unit, int16_t grid_x, int16_t grid_y) {
+    if (unit->grid_x == grid_x && unit->grid_y == grid_y) {
+        return true;
+    }
+
+    /* the owner decides where its units are, a peer never relocates units of the local team */
+    if (UnitsManager_TeamInfo[unit->team].team_type != TEAM_TYPE_REMOTE) {
+        return false;
+    }
+
+    if ((unit->flags & (STATIONARY | GROUND_COVER)) || unit->in_transit || grid_x < 0 || grid_y < 0 ||
+        grid_x >= ResourceManager_MapSize.x || grid_y >= ResourceManager_MapSize.y) {
+        return false;
+    }
+
+    bool is_on_map = false;
+
+    if (const auto units = Hash_MapHash[Point(unit->grid_x, unit->grid_y)]) {
+        for (auto it = units->Begin(), it_end = units->End(); it != it_end; ++it) {
+            if (it->Get() == unit) {
+                is_on_map = true;
+                break;
+            }
+        }
+    }
+
+    if (!is_on_map) {
+        return false;
+    }
+
+    SmartPointer<UnitInfo> copy = unit->MakeCopy();
+
+    unit->RefreshScreen();
+
+    Hash_MapHash.Remove(unit);
+
+    unit->OffsetDrawZones(grid_x * GFX_MAP_TILE_SIZE + GFX_MAP_TILE_SIZE / 2 - unit->x,
+                          grid_y * GFX_MAP_TILE_SIZE + GFX_MAP_TILE_SIZE / 2 - unit->y);
+
+    unit->grid_x = grid_x;
+    unit->grid_y = grid_y;
+
+    Hash_MapHash.Add(unit);
+
+    Access_UpdateMapStatus(unit, true);
+    Access_UpdateMapStatus(&*copy, false);
+
+    unit->RefreshScreen();
+
+    return true;
+}
+
+void Remote_ClearHeldPackets(uint16_t team) {
+    Remote_P53_Holding[team] = false;
+    Remote_P53_HeldPackets[team].clear();
+}
+
+void Remote_ReleaseHeldPackets(uint16_t team) {
+    Remote_P53_Holding[team] = false;
+
+    /* a released packet may start holding again, the remaining ones then stay queued in order */
+    while (!Remote_P53_Holding[team] && !Remote_P53_HeldPackets[team].empty()) {
+        NetPacket packet = std::move(Remote_P53_HeldPackets[team].front());
+
+        Remote_P53_HeldPackets[team].pop_front();
+
+        Remote_DispatchNetPacket(packet);
+    }
+}
+
+void Remote_ReleaseAllHeldPackets() {
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+        if (Remote_P53_Holding[team] || !Remote_P53_HeldPackets[team].empty()) {
+            AILOG(log, "Remote: Releasing {} held packets of team {} late.\n", Remote_P53_HeldPackets[team].size(),
+                  team);
+
+            Remote_ReleaseHeldPackets(team);
+        }
+    }
+}
+
 void Remote_ProcessNetPackets() {
     for (;;) {
         NetPacket packet;
-        uint8_t packet_type;
 
         const uint8_t receive_status = Remote_ReceivePacket(packet);
 
@@ -1082,6 +1248,24 @@ void Remote_ProcessNetPackets() {
             continue;
         }
 
+        const int32_t sender_team = Remote_GetSenderTeam(packet);
+
+        /* frame synchronization signals carry no game state and blocking synchronization waits on them */
+        if (sender_team >= 0 && Remote_P53_Holding[sender_team] &&
+            static_cast<uint8_t>(packet.GetBuffer()[0]) != REMOTE_PACKET_01) {
+            Remote_P53_HeldPackets[sender_team].push_back(std::move(packet));
+
+            continue;
+        }
+
+        Remote_DispatchNetPacket(packet);
+    }
+}
+
+void Remote_DispatchNetPacket(NetPacket& packet) {
+    uint8_t packet_type;
+
+    {
         {
             packet >> packet_type;
 
@@ -1262,6 +1446,14 @@ void Remote_ProcessNetPackets() {
                     Remote_ReceiveNetPacket_52(packet);
                 } break;
 
+                case REMOTE_PACKET_53: {
+                    Remote_ReceiveNetPacket_53(packet);
+                } break;
+
+                case REMOTE_PACKET_54: {
+                    Remote_ReceiveNetPacket_54(packet);
+                } break;
+
                 default: {
                     AILOG(log, "Received unknown packet type ({}).", packet_type - TRANSPORT_APPL_PACKET_ID);
                 } break;
@@ -1272,7 +1464,7 @@ void Remote_ProcessNetPackets() {
                       packet_type - TRANSPORT_APPL_PACKET_ID);
             }
         }
-    };
+    }
 }
 
 void Remote_NetErrorUnknownUnit(uint16_t unit_id) {
@@ -1732,33 +1924,31 @@ int32_t Remote_SiteSelectMenu() {
         MessageManager_ClearMessageBox();
     }
 
-    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+    int32_t proximity_state = 0;
+
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT && !proximity_state; ++team) {
         if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
-            int32_t proximity_state = GameManager_CheckLandingZones(GameManager_PlayerTeam, team);
+            proximity_state = GameManager_CheckLandingZones(GameManager_PlayerTeam, team);
+        }
+    }
 
-            if (proximity_state != 0) {
-                UnitsManager_TeamMissionSupplies[team].units.Clear();
-
-                return proximity_state;
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT && !proximity_state; ++team) {
+        if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+            for (int32_t team2 = 0; team2 < TRANSPORT_MAX_TEAM_COUNT; ++team2) {
+                if (team != team2 && UnitsManager_TeamInfo[team2].team_type == TEAM_TYPE_REMOTE &&
+                    GameManager_CheckLandingZones(team, team2)) {
+                    proximity_state = 5;
+                    break;
+                }
             }
         }
     }
 
-    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
-        if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
-            for (int32_t team2 = 0; team2 < TRANSPORT_MAX_TEAM_COUNT; ++team2) {
-                if (team != team2) {
-                    if (UnitsManager_TeamInfo[team2].team_type == TEAM_TYPE_REMOTE) {
-                        if (GameManager_CheckLandingZones(team, team2)) {
-                            UnitsManager_TeamMissionSupplies[team].units.Clear();
-                            UnitsManager_TeamMissionSupplies[team2].units.Clear();
+    if (proximity_state) {
+        /* every peer sees the same conflict and selects again, so wait for fresh supplies from all of them */
+        Remote_AdvanceSiteSelectRound();
 
-                            return 5;
-                        }
-                    }
-                }
-            }
-        }
+        return proximity_state;
     }
 
     Randomizer_SetSeed(Remote_RngSeed);
@@ -1866,15 +2056,29 @@ bool Remote_CheckDesync(uint16_t team, uint16_t crc_checksum) {
 
     Remote_ClearBarrierWaitIndicator(is_indicator_drawn);
 
+    bool result = true;
+
     for (int32_t i = TRANSPORT_MAX_TEAM_COUNT - 1; i >= 0; --i) {
         if (UnitsManager_TeamInfo[i].team_type == TEAM_TYPE_REMOTE) {
             if (Remote_TeamDataCrc16[i] != crc_checksum && Remote_IsNetworkGame) {
-                return false;
+                result = false;
             }
         }
     }
 
-    return true;
+    if (!result) {
+        std::string checksums = std::format("team {} {:04X}", team, crc_checksum);
+
+        for (int32_t i = 0; i < TRANSPORT_MAX_TEAM_COUNT; ++i) {
+            if (UnitsManager_TeamInfo[i].team_type == TEAM_TYPE_REMOTE) {
+                checksums += std::format(", team {} {:04X}", i, Remote_TeamDataCrc16[i]);
+            }
+        }
+
+        SDL_Log("Desync check failed, unit checksums: %s.", checksums.c_str());
+    }
+
+    return result;
 }
 
 void Remote_SendNetPacket_Signal(int32_t packet_type, int32_t team, uint8_t parameter) {
@@ -2230,6 +2434,7 @@ void Remote_SendNetPacket_12(int32_t team) {
 
     packet << static_cast<uint8_t>(REMOTE_PACKET_12);
     packet << static_cast<uint16_t>(team);
+    packet << Remote_SiteSelectRound;
 
     packet << supplies->start_gold;
     packet << supplies->team_gold;
@@ -2248,6 +2453,7 @@ void Remote_SendNetPacket_12(int32_t team) {
 
 void Remote_ReceiveNetPacket_12(NetPacket& packet) {
     uint16_t entity_id;
+    uint8_t round;
 
     packet >> entity_id;
 
@@ -2255,7 +2461,52 @@ void Remote_ReceiveNetPacket_12(NetPacket& packet) {
         return;
     }
 
-    TeamMissionSupplies* supplies = &UnitsManager_TeamMissionSupplies[entity_id];
+    packet >> round;
+
+    if (packet.IsMalformed()) {
+        return;
+    }
+
+    if (round == Remote_SiteSelectRound) {
+        Remote_ReadMissionSupplies(entity_id, packet);
+
+    } else if (round == static_cast<uint8_t>(Remote_SiteSelectRound + 1)) {
+        Remote_P12_PendingPackets[entity_id].Reset();
+        Remote_P12_PendingPackets[entity_id].Write(packet.GetBuffer(), packet.GetDataSize());
+        Remote_P12_PendingRound[entity_id] = round;
+        Remote_P12_PendingValid[entity_id] = true;
+
+    } else {
+        AILOG(log, "Remote: Dropped stale mission supplies of team {} (round {}, expected {}).\n", entity_id, round,
+              Remote_SiteSelectRound);
+    }
+}
+
+void Remote_AdvanceSiteSelectRound() {
+    ++Remote_SiteSelectRound;
+
+    for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+        if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+            UnitsManager_TeamMissionSupplies[team].units.Clear();
+            UnitsManager_TeamMissionSupplies[team].cargos.Clear();
+
+            if (Remote_P12_PendingValid[team] && Remote_P12_PendingRound[team] == Remote_SiteSelectRound) {
+                Remote_ReadMissionSupplies(team, Remote_P12_PendingPackets[team]);
+
+                if (Remote_P12_PendingPackets[team].IsMalformed()) {
+                    UnitsManager_TeamMissionSupplies[team].units.Clear();
+                    UnitsManager_TeamMissionSupplies[team].cargos.Clear();
+                }
+            }
+        }
+
+        Remote_P12_PendingValid[team] = false;
+        Remote_P12_PendingPackets[team].Reset();
+    }
+}
+
+void Remote_ReadMissionSupplies(uint16_t team, NetPacket& packet) {
+    TeamMissionSupplies* supplies = &UnitsManager_TeamMissionSupplies[team];
 
     supplies->units.Clear();
     supplies->cargos.Clear();
@@ -2265,7 +2516,7 @@ void Remote_ReceiveNetPacket_12(NetPacket& packet) {
     packet >> supplies->start_gold;
     packet >> supplies->team_gold;
     packet >> unit_count;
-    packet >> UnitsManager_TeamInfo[entity_id].stats_gold_spent_on_upgrades;
+    packet >> UnitsManager_TeamInfo[team].stats_gold_spent_on_upgrades;
     packet >> supplies->starting_position;
     packet >> supplies->proximity_alert_ack;
 
@@ -2823,41 +3074,45 @@ void Remote_ProcessNetPacket_23(struct Packet23Data& data, NetPacket& packet) {
     local >> packet_type;
     local >> entity_id;
 
-    local >> data.orders;
-    local >> data.state;
-    local >> data.prior_orders;
-    local >> data.prior_state;
-    local >> data.disabled_reaction_fire;
+    Remote_ReadPacket23Data(data, local);
+}
 
-    local >> data.parent_unit_id;
-    local >> data.experience;
+void Remote_ReadPacket23Data(struct Packet23Data& data, NetPacket& packet) {
+    packet >> data.orders;
+    packet >> data.state;
+    packet >> data.prior_orders;
+    packet >> data.prior_state;
+    packet >> data.disabled_reaction_fire;
 
-    local >> data.move_to_grid_x;
-    local >> data.move_to_grid_y;
-    local >> data.fire_on_grid_x;
-    local >> data.fire_on_grid_y;
-    local >> data.enemy_unit_id;
+    packet >> data.parent_unit_id;
+    packet >> data.experience;
 
-    local >> data.transfer_cargo;
-    local >> data.stealth_dice_roll;
+    packet >> data.move_to_grid_x;
+    packet >> data.move_to_grid_y;
+    packet >> data.fire_on_grid_x;
+    packet >> data.fire_on_grid_y;
+    packet >> data.enemy_unit_id;
 
-    local >> data.total_mining;
-    local >> data.raw_mining;
-    local >> data.fuel_mining;
-    local >> data.gold_mining;
+    packet >> data.transfer_cargo;
+    packet >> data.stealth_dice_roll;
 
-    local >> data.build_time;
-    local >> data.build_rate;
-    local >> data.unit_type;
-    local >> data.unit_id;
-    local >> data.grid_x;
-    local >> data.grid_y;
-    local >> data.team;
-    local >> data.hits;
-    local >> data.speed;
-    local >> data.shots;
-    local >> data.storage;
-    local >> data.ammo;
+    packet >> data.total_mining;
+    packet >> data.raw_mining;
+    packet >> data.fuel_mining;
+    packet >> data.gold_mining;
+
+    packet >> data.build_time;
+    packet >> data.build_rate;
+    packet >> data.unit_type;
+    packet >> data.unit_id;
+    packet >> data.grid_x;
+    packet >> data.grid_y;
+    packet >> data.team;
+    packet >> data.hits;
+    packet >> data.speed;
+    packet >> data.shots;
+    packet >> data.storage;
+    packet >> data.ammo;
 }
 
 void Remote_SendNetPacket_23(UnitInfo* unit) {
@@ -3322,6 +3577,8 @@ void Remote_SendNetPacket_38(UnitInfo* unit) {
 
     packet << unit->GetOrder();
     packet << unit->GetOrderState();
+    packet << unit->grid_x;
+    packet << unit->grid_y;
     packet << unit->move_to_grid_x;
     packet << unit->move_to_grid_y;
     packet << unit->group_speed;
@@ -3374,12 +3631,22 @@ void Remote_ReceiveNetPacket_38(NetPacket& packet) {
 
         UnitOrderType order;
         UnitOrderStateType order_state;
+        int16_t grid_x;
+        int16_t grid_y;
 
         packet >> order;
         packet >> order_state;
+        packet >> grid_x;
+        packet >> grid_y;
 
         unit->SetOrder(order);
         unit->SetOrderState(order_state);
+
+        /* the replay of the path has to start where the owner starts it */
+        if (!packet.IsMalformed() && !Remote_RelocateUnit(unit, grid_x, grid_y)) {
+            AILOG(log, "Remote: Unit {} starts a path at [{},{}], owner starts it at [{},{}].\n", entity_id,
+                  unit->grid_x + 1, unit->grid_y + 1, grid_x + 1, grid_y + 1);
+        }
 
         packet >> unit->move_to_grid_x;
         packet >> unit->move_to_grid_y;
@@ -3446,20 +3713,62 @@ void Remote_SendNetPacket_41(UnitInfo* unit, bool mode) {
     packet << static_cast<uint16_t>(unit->GetId());
     packet << mode;
 
+    packet << unit->grid_x;
+    packet << unit->grid_y;
+    packet << unit->speed;
+    packet << unit->group_speed;
+    packet << unit->shots;
+    packet << unit->move_fraction;
+
     Remote_TransmitPacket(packet, REMOTE_MULTICAST);
 }
 
 void Remote_ReceiveNetPacket_41(NetPacket& packet) {
     uint16_t entity_id;
     bool mode;
+    int16_t grid_x;
+    int16_t grid_y;
+    uint16_t speed;
+    uint16_t group_speed;
+    uint8_t shots;
+    uint8_t move_fraction;
 
     packet >> entity_id;
     packet >> mode;
+
+    packet >> grid_x;
+    packet >> grid_y;
+    packet >> speed;
+    packet >> group_speed;
+    packet >> shots;
+    packet >> move_fraction;
+
+    if (packet.IsMalformed()) {
+        return;
+    }
 
     UnitInfo* unit = Hash_UnitHash[entity_id];
 
     if (unit) {
         unit->BlockedOnPathRequest(mode, true);
+
+        /* The local replay of the move may still lack its final steps when the owner announces the end of the move,
+         * so the movement points are taken over from the owner.
+         */
+        unit->speed = speed;
+        unit->group_speed = group_speed;
+        unit->shots = shots;
+        unit->move_fraction = move_fraction;
+
+        /* the replay of the move may not have reached the cell where the owner stopped */
+        if (!Remote_RelocateUnit(unit, grid_x, grid_y)) {
+            SDL_Log("Move correction: unit %X stopped at [%i,%i], owner stopped it at [%i,%i], not relocated.",
+                    entity_id, unit->grid_x + 1, unit->grid_y + 1, grid_x + 1, grid_y + 1);
+        }
+
+        if (GameManager_SelectedUnit == unit) {
+            GameManager_UpdateInfoDisplay(unit);
+        }
 
     } else {
         Remote_NetErrorUnknownUnit(entity_id);
@@ -3705,4 +4014,463 @@ void Remote_ReceiveNetPacket_52(NetPacket& packet) {
     }
 
     packet >> Remote_TurnIndices[entity_id];
+}
+
+void Remote_SendNetPacket_53(int32_t team) {
+    TeamUnits* const team_units = UnitsManager_TeamInfo[team].team_units;
+    const auto& complexes = team_units->GetComplexes();
+    NetPacket packet;
+
+    packet << static_cast<uint8_t>(REMOTE_PACKET_53);
+    packet << static_cast<uint16_t>(team);
+    packet << GameManager_TurnCounter;
+    packet << static_cast<uint16_t>(complexes.GetCount());
+
+    for (auto it = complexes.Begin(), it_end = complexes.End(); it != it_end; ++it) {
+        team_units->WriteComplexPacket((*it).GetId(), packet);
+    }
+
+    Remote_TransmitPacket(packet, REMOTE_MULTICAST);
+}
+
+void Remote_ReceiveNetPacket_53(NetPacket& packet) {
+    uint16_t entity_id;
+    int32_t turn;
+
+    packet >> entity_id;
+
+    if (!Remote_IsValidTeamIndex(packet, entity_id)) {
+        return;
+    }
+
+    packet >> turn;
+
+    if (packet.IsMalformed()) {
+        return;
+    }
+
+    Remote_P53_PendingPackets[entity_id].Reset();
+    Remote_P53_PendingPackets[entity_id].Write(packet.GetBuffer(), packet.GetDataSize());
+    Remote_P53_PendingTurn[entity_id] = turn;
+    Remote_P53_PendingValid[entity_id] = true;
+
+    if (UnitsManager_TeamInfo[entity_id].team_type == TEAM_TYPE_REMOTE) {
+        Remote_P53_Holding[entity_id] = true;
+    }
+}
+
+void Remote_WaitComplexTotals(uint16_t team) {
+    const auto is_pending = [team]() {
+        return Remote_P53_PendingValid[team] && Remote_P53_PendingTurn[team] == GameManager_TurnCounter;
+    };
+
+    uint64_t time_stamp_timeout = timer_get();
+
+    bool is_indicator_drawn = false;
+
+    while (Remote_IsNetworkGame && UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE && !is_pending()) {
+        Remote_UiProcessTick(true);
+
+        if (!is_pending()) {
+            if (timer_elapsed_time(time_stamp_timeout) > REMOTE_RESPONSE_TIMEOUT) {
+                Remote_ResponseTimeout(team, true);
+            }
+
+            is_indicator_drawn = Remote_DrawBarrierWaitIndicator(is_indicator_drawn, time_stamp_timeout);
+        }
+
+        /* Pump the event queue, but discard the input: a synchronization barrier cannot be
+         * escaped and must not let the player issue commands while peers catch up.
+         */
+        get_input();
+    }
+
+    Remote_ClearBarrierWaitIndicator(is_indicator_drawn);
+
+    if (is_pending()) {
+        NetPacket& packet = Remote_P53_PendingPackets[team];
+        uint16_t complex_count;
+
+        packet >> complex_count;
+
+        for (uint16_t i = 0; i < complex_count && !packet.IsMalformed(); ++i) {
+            UnitsManager_TeamInfo[team].team_units->ReadComplexPacket(packet);
+        }
+
+        if (packet.IsMalformed()) {
+            AILOG(log, "Remote: Complex totals of team {} are malformed.\n", team);
+        }
+    }
+
+    Remote_P53_PendingValid[team] = false;
+    Remote_P53_PendingPackets[team].Reset();
+}
+
+static void Remote_SendUnitStates(uint16_t team, uint8_t sync_index) {
+    constexpr size_t units_per_packet = 32;
+    SmartList<UnitInfo>* const unit_lists[] = {&UnitsManager_GroundCoverUnits, &UnitsManager_MobileLandSeaUnits,
+                                               &UnitsManager_StationaryUnits, &UnitsManager_MobileAirUnits};
+    std::vector<UnitInfo*> units;
+
+    for (auto list : unit_lists) {
+        for (auto it = list->Begin(), it_end = list->End(); it != it_end; ++it) {
+            if ((*it).team == team && (*it).GetId() != 0xFFFF && !((*it).flags & EXPLODING)) {
+                units.push_back(it->Get());
+            }
+        }
+    }
+
+    size_t index = 0;
+
+    do {
+        const uint16_t count = static_cast<uint16_t>(std::min(units_per_packet, units.size() - index));
+        const bool is_last = index + count >= units.size();
+        NetPacket packet;
+
+        packet << static_cast<uint8_t>(REMOTE_PACKET_54);
+        packet << team;
+        packet << sync_index;
+        packet << is_last;
+        packet << count;
+
+        for (uint16_t i = 0; i < count; ++i) {
+            UnitInfo* const unit = units[index + i];
+
+            packet << unit->GetId();
+
+            Remote_CreateNetPacket_23(unit, packet);
+        }
+
+        if (is_last) {
+            packet << UnitsManager_TeamInfo[team].team_units->GetGold();
+            packet << UnitsManager_TeamInfo[team].stats_gold_spent_on_upgrades;
+            packet << UnitsManager_TeamInfo[team].research_topics;
+            packet << UnitsManager_TeamInfo[team].number_of_objects_created;
+            packet << UnitsManager_TeamInfo[team].unit_counters;
+        }
+
+        Remote_TransmitPacket(packet, REMOTE_MULTICAST);
+
+        index += count;
+
+    } while (index < units.size());
+}
+
+static void Remote_ApplyUnitState(uint16_t team, uint16_t unit_id, const struct Packet23Data& data) {
+    UnitInfo* const unit = Hash_UnitHash[unit_id];
+
+    if (!unit) {
+        SDL_Log("Desync correction: unit %X of team %i does not exist locally.", unit_id, team);
+
+        return;
+    }
+
+    if (unit->team != team || unit->GetUnitType() != data.unit_type) {
+        SDL_Log("Desync correction: unit %X is of team %i type %i locally, of team %i type %i on its owner.", unit_id,
+                unit->team, unit->GetUnitType(), team, data.unit_type);
+
+        return;
+    }
+
+    if (unit->flags & EXPLODING) {
+        return;
+    }
+
+    if (data.orders >= ORDER_COUNT_MAX || data.prior_orders >= ORDER_COUNT_MAX) {
+        SDL_Log("Desync correction: unit %X has out of range orders on its owner.", unit_id);
+
+        return;
+    }
+
+    std::string changes;
+
+    const auto take_over = [&changes](const char* name, auto& local, const auto remote) {
+        if (local != remote) {
+            changes += std::format(" {} {}->{}", name, static_cast<int32_t>(local), static_cast<int32_t>(remote));
+
+            local = remote;
+        }
+    };
+
+    {
+        auto order = unit->GetOrder();
+        auto state = unit->GetOrderState();
+        auto prior_order = unit->GetPriorOrder();
+        auto prior_state = unit->GetPriorOrderState();
+
+        take_over("order", order, static_cast<UnitOrderType>(data.orders));
+        take_over("state", state, static_cast<UnitOrderStateType>(data.state));
+        take_over("prior_order", prior_order, static_cast<UnitOrderType>(data.prior_orders));
+        take_over("prior_state", prior_state, static_cast<UnitOrderStateType>(data.prior_state));
+
+        unit->SetOrder(order);
+        unit->SetOrderState(state);
+        unit->SetPriorOrder(prior_order);
+        unit->SetPriorOrderState(prior_state);
+    }
+
+    take_over("disabled_reaction_fire", unit->disabled_reaction_fire, data.disabled_reaction_fire);
+
+    {
+        const uint16_t parent_id = unit->GetParent() ? unit->GetParent()->GetId() : 0;
+
+        if (parent_id != data.parent_unit_id) {
+            changes += std::format(" parent {:X}->{:X}", parent_id, data.parent_unit_id);
+
+            unit->SetParent(data.parent_unit_id ? Hash_UnitHash[data.parent_unit_id] : nullptr);
+        }
+    }
+
+    {
+        const uint16_t enemy_id = unit->GetEnemy() ? unit->GetEnemy()->GetId() : 0;
+
+        if (enemy_id != data.enemy_unit_id) {
+            changes += std::format(" enemy {:X}->{:X}", enemy_id, data.enemy_unit_id);
+
+            unit->SetEnemy(data.enemy_unit_id ? Hash_UnitHash[data.enemy_unit_id] : nullptr);
+        }
+    }
+
+    take_over("experience", unit->experience, data.experience);
+    take_over("move_to_grid_x", unit->move_to_grid_x, data.move_to_grid_x);
+    take_over("move_to_grid_y", unit->move_to_grid_y, data.move_to_grid_y);
+    take_over("fire_on_grid_x", unit->fire_on_grid_x, data.fire_on_grid_x);
+    take_over("fire_on_grid_y", unit->fire_on_grid_y, data.fire_on_grid_y);
+    take_over("transfer_cargo", unit->transfer_cargo, data.transfer_cargo);
+    take_over("stealth_dice_roll", unit->stealth_dice_roll, data.stealth_dice_roll);
+    take_over("total_mining", unit->total_mining, data.total_mining);
+    take_over("raw_mining", unit->raw_mining, data.raw_mining);
+    take_over("fuel_mining", unit->fuel_mining, data.fuel_mining);
+    take_over("gold_mining", unit->gold_mining, data.gold_mining);
+    take_over("build_time", unit->build_time, data.build_time);
+
+    {
+        uint16_t build_rate = static_cast<uint16_t>(unit->GetBuildRate());
+
+        take_over("build_rate", build_rate, data.build_rate);
+
+        unit->SetBuildRate(build_rate);
+    }
+
+    take_over("unit_id", unit->unit_id, data.unit_id);
+    take_over("hits", unit->hits, data.hits);
+    take_over("speed", unit->speed, data.speed);
+    take_over("shots", unit->shots, data.shots);
+    take_over("ammo", unit->ammo, data.ammo);
+
+    {
+        const auto storage = unit->storage;
+
+        take_over("storage", unit->storage, data.storage);
+
+        if (storage != unit->storage && unit->GetComplex()) {
+            Access_UpdateResourcesTotal(unit->GetComplex());
+        }
+    }
+
+    if (unit->grid_x != data.grid_x || unit->grid_y != data.grid_y) {
+        const int16_t grid_x = unit->grid_x;
+        const int16_t grid_y = unit->grid_y;
+        const bool is_relocated = Remote_RelocateUnit(unit, data.grid_x, data.grid_y);
+
+        changes += std::format(" position [{},{}]->[{},{}]{}", grid_x + 1, grid_y + 1, data.grid_x + 1, data.grid_y + 1,
+                               is_relocated ? "" : " not corrected");
+    }
+
+    if (!changes.empty()) {
+        SDL_Log("Desync correction: team %i \"%s\" %X:%s", team,
+                ResourceManager_GetUnit(unit->GetUnitType()).GetSingularName().data(), unit_id, changes.c_str());
+
+        if (GameManager_SelectedUnit == unit) {
+            GameManager_UpdateInfoDisplay(unit);
+        }
+    }
+}
+
+/* Units of a team that its owner does not have, e.g. a unit spawned only on this peer or destroyed only on the owner,
+ * are removed. Buildings are only reported as removing them involves their complex and connections.
+ */
+static void Remote_RemoveExtraUnits(uint16_t team, std::vector<uint16_t>& owner_unit_ids) {
+    SmartList<UnitInfo>* const unit_lists[] = {&UnitsManager_GroundCoverUnits, &UnitsManager_MobileLandSeaUnits,
+                                               &UnitsManager_StationaryUnits, &UnitsManager_MobileAirUnits};
+    std::vector<SmartPointer<UnitInfo>> extra_units;
+
+    std::sort(owner_unit_ids.begin(), owner_unit_ids.end());
+
+    for (auto list : unit_lists) {
+        for (auto it = list->Begin(), it_end = list->End(); it != it_end; ++it) {
+            if ((*it).team == team && (*it).GetId() != 0xFFFF && !((*it).flags & EXPLODING) &&
+                !std::binary_search(owner_unit_ids.begin(), owner_unit_ids.end(), (*it).GetId())) {
+                if ((*it).flags & (STATIONARY | GROUND_COVER)) {
+                    SDL_Log("Desync correction: team %i \"%s\" %X does not exist on its owner, not removed.", team,
+                            ResourceManager_GetUnit((*it).GetUnitType()).GetSingularName().data(), (*it).GetId());
+
+                } else {
+                    extra_units.push_back(SmartPointer<UnitInfo>(it->Get()));
+                }
+            }
+        }
+    }
+
+    for (auto& unit : extra_units) {
+        SDL_Log("Desync correction: team %i \"%s\" %X does not exist on its owner, removed.", team,
+                ResourceManager_GetUnit(unit->GetUnitType()).GetSingularName().data(), unit->GetId());
+
+        UnitsManager_DestroyUnit(unit.Get(), false);
+    }
+}
+
+void Remote_ReceiveNetPacket_54(NetPacket& packet) {
+    uint16_t entity_id;
+    uint8_t sync_index;
+    bool is_last;
+    uint16_t count;
+
+    packet >> entity_id;
+
+    if (!Remote_IsValidTeamIndex(packet, entity_id)) {
+        return;
+    }
+
+    packet >> sync_index;
+    packet >> is_last;
+    packet >> count;
+
+    if (packet.IsMalformed() || count > NetPacket::MaximumArrayCount) {
+        packet.SetMalformed();
+
+        return;
+    }
+
+    /* only the owner may dictate the state of its units */
+    const int32_t sender_team = Remote_GetSenderTeam(packet);
+
+    if (UnitsManager_TeamInfo[entity_id].team_type != TEAM_TYPE_REMOTE ||
+        (sender_team >= 0 && sender_team != entity_id)) {
+        AILOG(log, "Remote: Ignored unit states of team {} sent by team {}.\n", entity_id, sender_team);
+
+        return;
+    }
+
+    if (Remote_StateSyncReceivingIndices[entity_id] != sync_index) {
+        Remote_StateSyncReceivingIndices[entity_id] = sync_index;
+        Remote_StateSyncUnitIds[entity_id].clear();
+    }
+
+    for (uint16_t i = 0; i < count; ++i) {
+        struct Packet23Data data;
+        uint16_t unit_id;
+
+        packet >> unit_id;
+
+        Remote_ReadPacket23Data(data, packet);
+
+        if (packet.IsMalformed()) {
+            return;
+        }
+
+        Remote_StateSyncUnitIds[entity_id].push_back(unit_id);
+
+        Remote_ApplyUnitState(entity_id, unit_id, data);
+    }
+
+    if (is_last) {
+        uint32_t gold;
+        uint32_t gold_spent_on_upgrades;
+        ResearchTopic research_topics[RESEARCH_TOPIC_COUNT];
+        uint16_t number_of_objects_created;
+        uint32_t unit_counters[UNIT_END];
+
+        packet >> gold;
+        packet >> gold_spent_on_upgrades;
+        packet >> research_topics;
+        packet >> number_of_objects_created;
+        packet >> unit_counters;
+
+        if (packet.IsMalformed()) {
+            return;
+        }
+
+        /* the counters assign the ids of new units, peers that diverge here would address different units later */
+        CTInfo& team_info = UnitsManager_TeamInfo[entity_id];
+
+        if (team_info.number_of_objects_created != number_of_objects_created ||
+            memcmp(team_info.unit_counters, unit_counters, sizeof(unit_counters))) {
+            SDL_Log("Desync correction: team %i unit counters, objects created %i->%i", entity_id,
+                    team_info.number_of_objects_created, number_of_objects_created);
+
+            team_info.number_of_objects_created = number_of_objects_created;
+            memcpy(team_info.unit_counters, unit_counters, sizeof(unit_counters));
+        }
+
+        Remote_RemoveExtraUnits(entity_id, Remote_StateSyncUnitIds[entity_id]);
+
+        Remote_StateSyncUnitIds[entity_id].clear();
+
+        TeamUnits* const team_units = UnitsManager_TeamInfo[entity_id].team_units;
+
+        if (team_units->GetGold() != gold) {
+            SDL_Log("Desync correction: team %i gold %u->%u", entity_id, team_units->GetGold(), gold);
+
+            team_units->SetGold(gold);
+        }
+
+        UnitsManager_TeamInfo[entity_id].stats_gold_spent_on_upgrades = gold_spent_on_upgrades;
+
+        if (memcmp(UnitsManager_TeamInfo[entity_id].research_topics, research_topics, sizeof(research_topics))) {
+            SDL_Log("Desync correction: team %i research topics", entity_id);
+
+            memcpy(UnitsManager_TeamInfo[entity_id].research_topics, research_topics, sizeof(research_topics));
+        }
+
+        Remote_StateSyncIndices[entity_id] = sync_index;
+    }
+}
+
+void Remote_SynchronizeUnitStates() {
+    ++Remote_StateSyncIndex;
+
+    Remote_SendUnitStates(GameManager_PlayerTeam, Remote_StateSyncIndex);
+
+    const auto is_pending = [](int32_t team) {
+        return UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE &&
+               Remote_StateSyncIndices[team] != Remote_StateSyncIndex;
+    };
+
+    const auto is_any_pending = [&is_pending]() {
+        for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+            if (is_pending(team)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    uint64_t time_stamp_timeout = timer_get();
+
+    bool is_indicator_drawn = false;
+
+    while (Remote_IsNetworkGame && is_any_pending()) {
+        Remote_UiProcessTick(true);
+
+        if (is_any_pending()) {
+            if (timer_elapsed_time(time_stamp_timeout) > REMOTE_RESPONSE_TIMEOUT) {
+                for (int32_t team = 0; team < TRANSPORT_MAX_TEAM_COUNT; ++team) {
+                    if (is_pending(team)) {
+                        Remote_ResponseTimeout(team, true);
+                    }
+                }
+            }
+
+            is_indicator_drawn = Remote_DrawBarrierWaitIndicator(is_indicator_drawn, time_stamp_timeout);
+        }
+
+        /* Pump the event queue, but discard the input: a synchronization barrier cannot be
+         * escaped and must not let the player issue commands while peers catch up.
+         */
+        get_input();
+    }
+
+    Remote_ClearBarrierWaitIndicator(is_indicator_drawn);
 }

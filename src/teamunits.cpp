@@ -128,7 +128,20 @@ void TeamUnits::ReadComplexPacket(NetPacket& packet) {
 
     packet >> complex_id;
 
-    GetComplex(complex_id)->ReadPacket(packet);
+    Complex* complex = GetComplex(complex_id);
+
+    /* the complex may not exist yet locally if the building that founds it is still being replicated */
+    if (complex) {
+        complex->ReadPacket(packet);
+
+    } else {
+        /* consume the totals so that further complexes in the same packet stay aligned */
+        Complex unknown_complex(complex_id);
+
+        unknown_complex.ReadPacket(packet);
+
+        AILOG(log, "Complex {} is unknown, ignoring its remote update.\n", complex_id);
+    }
 }
 
 uint32_t TeamUnits::GetGold() { return gold; }

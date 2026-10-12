@@ -25,6 +25,7 @@
 
 #include <ctime>
 #include <format>
+#include <fstream>
 #include <vector>
 
 #include "access.hpp"
@@ -333,6 +334,7 @@ static void GameManager_UpdateGuiControl(uint16_t team);
 static uint16_t GameManager_GetCrc16(uint16_t data, uint16_t crc_checksum);
 static uint16_t GameManager_GetUnitListChecksum(SmartList<UnitInfo>* units, uint16_t team, uint16_t crc_checksum);
 static bool GameManager_CheckDesync();
+static void GameManager_WriteDesyncReport(uint16_t crc_checksum);
 static void GameManager_UpdateGui(uint16_t team, int32_t game_state, bool enable_autosave);
 static bool GameManager_AreTeamsFinishedTurn();
 static void GameManager_ProgressTurn();
@@ -2025,6 +2027,19 @@ void GameManager_ResupplyUnits(uint16_t team, SmartList<UnitInfo>* units) {
 void GameManager_ManageEconomy(uint16_t team) {
     UnitsManager_TeamInfo[team].team_units->OptimizeComplexes(team);
 
+    /* Only the owner optimizes the production of its complexes, so the storage buildings must be refilled from the
+     * complex totals of the owner on every peer. The owner transmits its totals after the replicated orders, and
+     * peers apply both before they distribute the totals.
+     */
+    if (Remote_IsNetworkGame) {
+        if (team == GameManager_PlayerTeam) {
+            Remote_SendNetPacket_53(team);
+
+        } else if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+            Remote_WaitComplexTotals(team);
+        }
+    }
+
     GameManager_UpdateProductions(team, &UnitsManager_MobileLandSeaUnits);
     GameManager_UpdateProductions(team, &UnitsManager_StationaryUnits);
     GameManager_UpdateProductions(team, &UnitsManager_MobileAirUnits);
@@ -2320,11 +2335,72 @@ uint16_t GameManager_GetUnitListChecksum(SmartList<UnitInfo>* units, uint16_t te
     return crc_checksum;
 }
 
+void GameManager_WriteDesyncReport(uint16_t crc_checksum) {
+    /* Every peer writes this snapshot at the same synchronization point, so diffing the reports of all players
+     * reveals which units diverged. The fields are the ones GameManager_GetUnitListChecksum() covers, plus the
+     * unit orders for context.
+     */
+    const struct {
+        const char* name;
+        SmartList<UnitInfo>* units;
+    } unit_lists[] = {{"ground cover", &UnitsManager_GroundCoverUnits},
+                      {"mobile land and sea", &UnitsManager_MobileLandSeaUnits},
+                      {"stationary", &UnitsManager_StationaryUnits},
+                      {"mobile air", &UnitsManager_MobileAirUnits}};
+
+    const auto filepath =
+        (ResourceManager_FilePathGamePref / std::format("desync-turn{}.txt", GameManager_TurnCounter)).lexically_normal();
+    std::ofstream file(filepath);
+
+    if (!file.is_open()) {
+        SDL_Log("Desync report could not be written to %s.", filepath.string().c_str());
+
+        return;
+    }
+
+    file << std::format("turn {}, player team {}, checksum {:04X}\n", GameManager_TurnCounter, GameManager_PlayerTeam,
+                        crc_checksum);
+
+    for (const auto& list : unit_lists) {
+        file << std::format("\n[{}]\n", list.name);
+        file << "team type unit_id id grid_x grid_y hits speed shots storage ammo order order_state\n";
+
+        for (int32_t team = PLAYER_TEAM_RED; team < PLAYER_TEAM_MAX; ++team) {
+            if (UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_NONE && team != PLAYER_TEAM_ALIEN) {
+                continue;
+            }
+
+            for (auto it = list.units->Begin(), it_end = list.units->End(); it != it_end; ++it) {
+                if ((*it).GetId() != 0xFFFF && !((*it).flags & EXPLODING) && (*it).team == team) {
+                    const auto& unit = ResourceManager_GetUnit((*it).GetUnitType());
+                    const auto speed = ((*it).flags & STATIONARY) ? std::string("-") : std::to_string((*it).speed);
+                    const auto storage = unit.GetCargoType() ? std::to_string((*it).storage) : std::string("-");
+
+                    file << std::format("{} \"{}\" {} {} {} {} {} {} {} {} {} {} {}\n", (*it).team,
+                                        unit.GetSingularName(), (*it).unit_id, (*it).GetId(), (*it).grid_x,
+                                        (*it).grid_y, (*it).hits, speed, (*it).shots, storage, (*it).ammo,
+                                        static_cast<int32_t>((*it).GetOrder()),
+                                        static_cast<int32_t>((*it).GetOrderState()));
+                }
+            }
+        }
+    }
+
+    SDL_Log("Desync detected on turn %i, unit snapshot written to %s.", GameManager_TurnCounter,
+            filepath.string().c_str());
+}
+
 bool GameManager_CheckDesync() {
     bool result;
 
     if (Remote_IsNetworkGame) {
         uint16_t crc_checksum;
+
+        /* every peer has progressed the build state of all teams by now */
+        Remote_ReleaseAllHeldPackets();
+
+        /* peers take over the state of the units of every owner, the checksums then verify the result */
+        Remote_SynchronizeUnitStates();
 
         crc_checksum = 0xFFFF;
 
@@ -2348,8 +2424,15 @@ bool GameManager_CheckDesync() {
             result = true;
 
         } else {
+            GameManager_WriteDesyncReport(crc_checksum);
+
             if (DesyncMenu_Menu()) {
-                if (!GameManager_LoadGame(10, GameManager_MenuFadeOut())) {
+                const auto mission = ResourceManager_GetMissionManager()->GetMission();
+                const auto save_file_category = SaveLoad_GetSaveFileCategory(mission->GetCategory());
+
+                // Restart from the latest autosave, not from the save file this session was started from
+                if (!mission->SetMission(SaveLoad_GetFilePath(save_file_category, 10)) ||
+                    !GameManager_LoadGame(10, GameManager_MenuFadeOut())) {
                     GameManager_GameState = GAME_STATE_3_MAIN_MENU;
 
                     MessageManager_DrawMessage(_(df36), MESSAGE_BOX_INFO, MESSAGE_BOX_MODAL);
@@ -8124,6 +8207,11 @@ void GameManager_ProgressBuildState(uint16_t team) {
     for (auto it = complexes.Begin(), it_end = complexes.End(); it != it_end; ++it) {
         Access_UpdateResourcesTotal(it->Get());
         GameManager_OptimizeProduction(team, it->Get(), false, true);
+    }
+
+    /* the owner may have issued orders after it spawned the new units, these are applied only now */
+    if (Remote_IsNetworkGame && UnitsManager_TeamInfo[team].team_type == TEAM_TYPE_REMOTE) {
+        Remote_ReleaseHeldPackets(team);
     }
 
     GameManager_GameState = GAME_STATE_8_IN_GAME;
