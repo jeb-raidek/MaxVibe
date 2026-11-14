@@ -1,6 +1,15 @@
-find_program(MAKENSIS_EXECUTABLE NAMES makensis DOC "The NSIS package maker command")
+# MSYS2 publishes NSIS for 64-bit targets only, so the MINGW32 job cannot install it with pacman and
+# relies on the NSIS installation of the runner. The installer records itself in the registry, which is
+# how upstream locates it; searching the registry keeps the lookup working when it is not on PATH.
+find_program(MAKENSIS_EXECUTABLE
+	NAMES makensis
+	PATHS "[HKEY_LOCAL_MACHINE\\SOFTWARE\\NSIS]"
+	REGISTRY_VIEW BOTH
+	DOC "The NSIS package maker command"
+)
 if(MAKENSIS_EXECUTABLE)
 	list(APPEND CPACK_GENERATOR "NSIS")
+	set(CPACK_NSIS_EXECUTABLE "${MAKENSIS_EXECUTABLE}")
 
 	if(X86)
 		set (CPACK_NSIS_INSTALL_ROOT "$PROGRAMFILES")

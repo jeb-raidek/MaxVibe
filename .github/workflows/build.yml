@@ -544,7 +544,10 @@ jobs:
 
       -  name: Setup Dependencies
          run: |
-            pacman -S --noconfirm git mingw-w64-i686-toolchain p7zip mingw-w64-i686-cmake mingw-w64-i686-ninja mingw-w64-i686-nsis mingw-w64-i686-gettext mingw-w64-i686-ccache make
+            # MSYS2 builds no i686 NSIS package: mingw-w64-nsis is published for ucrt64, clang64 and
+            # mingw64 only. cmake/nsis/nsis.cmake treats NSIS as optional and finds makensis on the
+            # runner image, so the 32-bit installer is still produced without a pacman package.
+            pacman -S --noconfirm git mingw-w64-i686-toolchain p7zip mingw-w64-i686-cmake mingw-w64-i686-ninja mingw-w64-i686-gettext mingw-w64-i686-ccache make
 
       -  name: Checkout
          uses: actions/checkout@v7

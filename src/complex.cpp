@@ -21,6 +21,7 @@
 
 #include "complex.hpp"
 
+#include "ailog.hpp"
 #include "game_manager.hpp"
 #include "net_packet.hpp"
 #include "registerarray.hpp"
@@ -81,7 +82,14 @@ void Complex::ReadPacket(NetPacket& packet) {
     packet >> workers;
     packet >> packet_buildings;
 
-    SDL_assert(buildings == packet_buildings);
+    /* The owner sends this packet as soon as its complex changes, but peers attach or detach the affected building
+     * only when they later execute the replicated unit order. A transient mismatch is therefore expected, and the
+     * totals are recalculated from the member buildings once they catch up.
+     */
+    if (buildings != packet_buildings) {
+        AILOG(log, "Complex {}: remote building count {} differs from local count {}.\n", id, packet_buildings,
+              buildings);
+    }
 }
 
 void Complex::GetCargoMinable(Cargo& capacity) {

@@ -3602,7 +3602,10 @@ void UnitInfo::BlockedOnPathRequest(bool mode, bool skip_notification) {
 
     MoveFinished(mode);
 
-    if (Remote_IsNetworkGame) {
+    /* Peers replay the moves of remote units at their own pace, so only the owner may announce where a move ended.
+     * A peer that finishes first would otherwise cut the move of the owner short.
+     */
+    if (Remote_IsNetworkGame && UnitsManager_TeamInfo[team].team_type != TEAM_TYPE_REMOTE) {
         if (!skip_notification) {
             Remote_SendNetPacket_41(this, mode);
         }
